@@ -45,10 +45,10 @@ class SuggestPlanRequest(BaseModel):
     requirements_text: str
     boq: List[BOQItem] = Field(default_factory=list)
     selected_vendor: Optional[str] = None
-    # NEW:
+    # extra context
     industry: Optional[str] = None
-    proposal_type: Optional[str] = None           # "short" | "detailed"
-    deployment_type: Optional[str] = None         # "on prem" | "hybrid" | "cloud" | "dark site"
+    proposal_type: Optional[str] = None         # "short" | "detailed"
+    deployment_type: Optional[str] = None       # "on prem" | "hybrid" | "cloud" | "dark site"
     providers: List[str] = Field(default_factory=list)
 
     constraints: Constraints = Field(default_factory=Constraints)
@@ -70,7 +70,26 @@ class RankedService(BaseModel):
     popularity_score: float = 0.0
     priority_score: float = 0.0
 
+# ---------- Journey models ----------
+
+class JourneyPhase(BaseModel):
+    phase: str
+    services: List[Dict[str, Any]]
+    phase_days: int
+    phase_cost_usd: float
+
+class JourneyTotals(BaseModel):
+    days: int
+    cost_usd: float
+
+class JourneyModel(BaseModel):
+    phases: List[JourneyPhase]
+    totals: JourneyTotals
+
+# ---------- Responses ----------
+
 class SuggestPlanResponse(BaseModel):
     count: int
     items: List[RankedService]
+    journey: Optional[JourneyModel] = None   # added
     debug: Optional[Dict[str, Any]] = None

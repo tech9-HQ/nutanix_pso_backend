@@ -1,303 +1,412 @@
 # app/services/ranker.py
-from typing import List, Tuple, Dict, Any, Optional
-from app.models.schemas import SuggestPlanRequest, RankedService
-from app.services.proposals_repo import suggest_services_repo
+from __future__ import annotations
+from typing import List, Tuple, Dict, Any
 import re
 
-# -------------------------- utils --------------------------
+from app.models.schemas import SuggestPlanRequest, RankedService
+from app.services.proposals_repo import suggest_services_repo
+from app.services.llm_selector import llm_pick_services
 
-def _norm(x: float, lo: float, hi: float) -> float:
-    if x is None or hi <= lo:
-        return 0.0
-    v = (x - lo) / (hi - lo)
-    return 0.0 if v < 0 else (1.0 if v > 1 else v)
+
+# ============== token utils ==============
 
 def _tokenize(s: str) -> List[str]:
     if not s:
         return []
     s = s.lower()
     s = re.sub(r"[^a-z0-9\s]+", " ", s)
-    toks = s.split()
-    bigrams = [f"{toks[i]} {toks[i+1]}" for i in range(len(toks) - 1)]
-    return toks + bigrams
+    return s.split()
 
-def _contains_any(text: str, tokens: List[str]) -> bool:
-    if not tokens:
-        return True
-    t = text.lower()
-    return any(tok.lower() in t for tok in tokens)
 
-def _deployment_to_platforms(dep: Optional[str]) -> List[str]:
-    if not dep:
-        return []
-    d = dep.lower().strip()
-    if d in {"on prem", "on-prem", "onprem", "dark site", "dark-site", "darksite"}:
-        return ["ahv"]
-    if d in {"hybrid"}:
-        return ["ahv", "aws", "azure"]
-    if d in {"cloud"}:
-        return ["aws", "azure"]
-    return []
+# ============== scope + need detection ==============
 
-# -------------------------- intent + phases --------------------------
+def _extract_scope_details(req: SuggestPlanRequest) -> Dict[str, Any]:
+    qtext = f"{req.requirements_text or ''} {' '.join([b.description or '' for b in (req.boq or [])])}".lower()
 
-def classify_intent(req_text: str, boq: List[Any]) -> Dict[str, Any]:
-    """Very light heuristic classifier. No external calls."""
-    t = " ".join([(req_text or "")] + [f"{getattr(b,'sku',None) or ''} {getattr(b,'description',None) or ''}" for b in (boq or [])]).lower()
+    vm_count = 0
+    for pattern in [r'(\d+)\s*vms?\b', r'(\d+)\s*virtual\s*machines?\b']:
+        m = re.search(pattern, qtext)
+        if m:
+            vm_count = max(vm_count, int(m.group(1)))
 
-    wants_migration = any(k in t for k in ["migrate", "migration", "vmware", "move", "relocate"])
-    wants_dr = any(k in t for k in ["dr", "disaster", "recovery", "metro", "witness", "protection domain", "protection-domain", "protection", "near sync", "nearsync", "sync"])
-    db_signals = any(k in t for k in ["oracle", "postgres", "mysql", "sql server", "database", "ndb"])
-    infra_signals = any(k in t for k in ["cluster", "nci", "ahv", "flow", "network", "microsegmentation", "vpc"])
+    node_count = 0
+    for pattern in [r'(\d+)\s*nodes?\b', r'(\d+)\s*servers?\b', r'(\d+)\s*dell\s*nodes?\b']:
+        m = re.search(pattern, qtext)
+        if m:
+            node_count = max(node_count, int(m.group(1)))
 
-    families: List[str] = []
-    if db_signals:
-        families.append("NDB")
-    if infra_signals or wants_dr:
-        families.append("NCI")
-    # broaden if nothing detected
-    if not families:
-        families = ["NDB", "NCI", "NC2", "NKP", "NUS"]
+    db_keywords = ['database', 'oracle', 'sql server', 'postgres', 'mysql', 'mongodb', 'db migration']
+    has_database = any(kw in qtext for kw in db_keywords)
+
+    source_platform = None
+    if any(kw in qtext for kw in ['vmware', 'vsphere', 'vcenter', 'esxi']):
+        source_platform = 'vmware'
+    elif any(kw in qtext for kw in ['hyperflex', 'cisco', 'ucs']):
+        source_platform = 'cisco_hyperflex'
+    elif any(kw in qtext for kw in ['hyper-v', 'hyperv', 'microsoft']):
+        source_platform = 'hyperv'
+
+    target_platform = None
+    if any(kw in qtext for kw in ['ahv', 'acropolis']):
+        target_platform = 'ahv'
+    elif 'aws' in qtext:
+        target_platform = 'aws'
+    elif 'azure' in qtext:
+        target_platform = 'azure'
+
+    needs_cluster_config = node_count > 0 or any(kw in qtext for kw in [
+        'configure', 'configuration', 'setup', 'deploy cluster', 'rack and stack'
+    ])
 
     return {
-        "wants_migration": wants_migration,
-        "wants_dr": wants_dr,
-        "families_hint": families
+        'vm_count': vm_count,
+        'node_count': node_count,
+        'has_database': has_database,
+        'source_platform': source_platform,
+        'target_platform': target_platform,
+        'needs_cluster_config': needs_cluster_config,
+        'has_boq': bool(req.boq and len(req.boq) >= 2),
     }
 
-def generate_phase_plan(intent: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Return ordered phases to fetch candidates for."""
-    phases: List[Dict[str, Any]] = []
 
-    # Always consider assessment/design early
-    phases.append({"name": "Assessment", "service_types": ["assessment"]})
-    phases.append({"name": "Design", "service_types": ["design"]})
+def _detect_service_needs(req: SuggestPlanRequest, scope: Dict[str, Any]) -> Dict[str, Any]:
+    qtext = f"{req.requirements_text or ''} {' '.join([b.description or '' for b in (req.boq or [])])}".lower()
+    tokens = set(_tokenize(qtext))
 
-    # Deployment is common
-    phases.append({"name": "Deployment", "service_types": ["deployment"]})
+    return {
+        'needs_assessment': (
+            not scope['has_boq'] or
+            scope['vm_count'] > 0 or
+            any(t in tokens for t in ['assess', 'fitcheck', 'sizing', 'evaluation', 'poc'])
+        ),
+        'needs_deployment': (
+            scope['node_count'] > 0 or
+            scope['needs_cluster_config'] or
+            any(t in tokens for t in ['deploy', 'setup', 'configure', 'infrastructure', 'expansion'])
+        ),
+        'needs_migration': (
+            (scope['vm_count'] > 0 and scope['source_platform'] is not None) or
+            any(t in tokens for t in ['migrate', 'migration', 'move', 'consolidate', 'move', 'move out'])
+        ),
+        'needs_db_migration': scope['has_database'] and any(t in tokens for t in ['migrate', 'migration']),
+        'needs_development': any(t in tokens for t in ['custom', 'automation', 'integration', 'api', 'script']),
+        'needs_ai_analytics': any(t in tokens for t in ['ai', 'machine', 'analytics', 'ml', 'data science']),
+        'needs_optimization': any(t in tokens for t in ['optimize', 'health', 'performance', 'tuning']),
+    }
 
-    if intent.get("wants_migration"):
-        phases.append({"name": "Migration", "service_types": ["migration"]})
 
-    if intent.get("wants_dr"):
-        phases.append({"name": "DR", "service_types": ["deployment"], "keywords": ["dr", "metro", "protection"]})
+# ============== relevance scoring ==============
 
-    return phases
+def _calculate_relevance_score(
+    service: Dict[str, Any],
+    needs: Dict[str, Any],
+    scope: Dict[str, Any],
+    query_text: str
+) -> Tuple[float, List[str]]:
+    score = 0.0
+    reasons: List[str] = []
 
-# -------------------------- scoring --------------------------
+    svc_name = (service.get('service_name') or '').lower()
+    svc_type = (service.get('service_type') or '').lower()
+    category = (service.get('category_name') or '').lower()
 
-def _keyword_score(query: str, row: Dict[str, Any], wants_dr: bool, wants_migration: bool) -> Tuple[float, str]:
-    q_tokens = _tokenize(query)
-    hay = " ".join([
-        row.get("service_name") or "",
-        row.get("positioning") or "",
-        " ".join(row.get("canonical_names") or []),
-        row.get("category_name") or "",
-        row.get("product_family") or "",
-    ]).lower()
+    # hard de-bias: no DB scope => penalize "database" services
+    if not scope['has_database']:
+        if 'database' in svc_name or 'database' in category:
+            score -= 0.25
+            reasons.append('No DB scope; deprioritize database services')
 
-    hits = sum(1 for t in q_tokens if t in hay)
-    exact = 1.0 if any(t in (row.get("canonical_names") or []) for t in q_tokens) else 0.0
-    score = hits * 0.15 + exact * 0.4
-    notes = [f"hits={hits}", f"exact={bool(exact)}"]
-
-    if wants_dr and any(k in hay for k in [" dr ", "disaster", "recovery", "metro", "protection domain", "witness", "protection", "nearsync", "near sync", "sync"]):
-        score += 0.15
-        notes.append("dr_boost")
-    if wants_migration and any(k in hay for k in ["migration", "move", "migrate"]):
-        score += 0.10
-        notes.append("mig_boost")
-
-    return score, ", ".join(notes)
-
-def score_results(query: str, rows: List[Dict[str, Any]], top_k: int, wants_dr: bool, wants_migration: bool) -> List[Tuple[float, str, Dict[str, Any]]]:
-    pri = [r.get("priority_score") or 0.0 for r in rows]
-    pop = [r.get("popularity_score") or 0.0 for r in rows]
-    lo_p, hi_p = (min(pri) if pri else 0.0), (max(pri) if pri else 1.0)
-    lo_q, hi_q = (min(pop) if pop else 0.0), (max(pop) if pop else 1.0)
-
-    ranked: List[Tuple[float, str, Dict[str, Any]]] = []
-    for r in rows:
-        pri_n = _norm(float(r.get("priority_score") or 0.0), lo_p, hi_p)
-        pop_n = _norm(float(r.get("popularity_score") or 0.0), lo_q, hi_q)
-        kw, why = _keyword_score(query, r, wants_dr=wants_dr, wants_migration=wants_migration)
-        score = (0.50 * pri_n) + (0.25 * pop_n) + (0.25 * kw)
-        ranked.append((score, f"pri={pri_n:.2f}, pop={pop_n:.2f}, {why}", r))
-
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return ranked[:max(1, top_k)]
-
-# -------------------------- repository fetch per phase --------------------------
-
-def _fetch_candidates_for_phase(
-    phase: Dict[str, Any],
-    families: List[str],
-    platforms: Optional[List[str]],
-    prefer_mig: bool,
-    per_family_cap: int
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    svc_types: List[str] = list(phase.get("service_types") or [])
-    keywords: List[str] = list(phase.get("keywords") or [])
-
-    for fam in families:
-        # base pull by service_type(s)
-        if svc_types:
-            for st in svc_types:
-                rows = suggest_services_repo(
-                    product_family=fam,
-                    platforms=platforms,
-                    limit=per_family_cap,
-                    service_type=st,
-                    supports_db_migration=True if (prefer_mig and st == "migration") else None,
-                    max_duration=None,
-                    price_cap=None,
-                    q=None,  # keep q empty for broad pull
-                )
-                out.extend(rows)
+    # assessment / fitcheck
+    if 'assessment' in category or 'fitcheck' in svc_name:
+        if needs['needs_assessment']:
+            score += 0.20
+            reasons.append('Assessment needed for sizing')
+            if scope['vm_count'] > 0:
+                score += 0.10
+                reasons.append(f"Sizing for {scope['vm_count']} VMs")
         else:
-            rows = suggest_services_repo(
-                product_family=fam,
-                platforms=platforms,
-                limit=per_family_cap,
-                service_type=None,
-                supports_db_migration=True if prefer_mig else None,
-                q=None,
-            )
-            out.extend(rows)
+            score -= 0.15
 
-        # keyword-narrowed pulls (safe tokens, repo handles tokenization)
-        for kw in keywords:
-            rows_kw = suggest_services_repo(
-                product_family=fam,
-                platforms=platforms,
-                limit=per_family_cap,
-                service_type="deployment" if fam in {"NCI", "NC2"} else None,
-                supports_db_migration=None,
-                q=kw,
-            )
-            out.extend(rows_kw)
+    # deployment
+    if svc_type == 'deployment' or any(k in svc_name for k in ['infrastructure deployment', 'infrastructure expansion']):
+        if needs['needs_deployment']:
+            score += 0.25
+            reasons.append('Infrastructure deployment required')
+            if scope['node_count'] > 0:
+                score += 0.15
+                reasons.append(f"Configuring {scope['node_count']} nodes")
+            if scope['needs_cluster_config']:
+                score += 0.10
+                reasons.append('Cluster configuration needed')
+        else:
+            score -= 0.30
 
-    return out
+    # vm migration (non-db)
+    if svc_type == 'migration' and 'database' not in category:
+        if needs['needs_migration']:
+            score += 0.30
+            reasons.append('VM migration required')
+            if scope['vm_count'] > 0:
+                score += 0.15
+                reasons.append(f"Migrating {scope['vm_count']} VMs")
+            if 'move' in svc_name and scope['source_platform'] in ['vmware', 'cisco_hyperflex']:
+                score += 0.20
+                reasons.append(f"Nutanix Move for {scope['source_platform']}")
+            if 'hyperflex' in svc_name and scope['source_platform'] == 'cisco_hyperflex':
+                score += 0.25
+                reasons.append('HyperFlex to AHV migration specialist')
+        else:
+            score -= 0.40
 
-# -------------------------- main planner --------------------------
+    # db migration services
+    if 'database' in category and 'migration' in svc_name:
+        if needs['needs_db_migration']:
+            score += 0.30
+            reasons.append('Database migration required')
+        else:
+            score -= 0.35
+
+    # dev services
+    if 'development' in category:
+        if needs['needs_development']:
+            score += 0.20
+            reasons.append('Custom development needed')
+        else:
+            score -= 0.25
+
+    # ai/analytics
+    if 'ai' in category or 'analytics' in category:
+        if needs['needs_ai_analytics']:
+            score += 0.25
+            reasons.append('AI/Analytics workload')
+        else:
+            score -= 0.30
+
+    # optimization
+    if any(k in svc_name for k in ['health check', 'optimization', 'performance']):
+        if needs['needs_optimization']:
+            score += 0.15
+            reasons.append('Optimization services')
+        else:
+            score -= 0.10
+
+    # keyword overlap
+    query_tokens = set(_tokenize(query_text))
+    service_tokens = set(_tokenize(f"{svc_name} {category}"))
+    overlap = len(query_tokens & service_tokens)
+    if overlap > 0:
+        kw_score = min(0.15, overlap * 0.03)
+        score += kw_score
+        reasons.append(f"{overlap} keyword matches")
+
+    return score, reasons
+
+
+# ============== minimal service set selection ==============
+
+def _select_core_services(
+    all_services: List[Dict[str, Any]],
+    needs: Dict[str, Any],
+    scope: Dict[str, Any],
+    limit: int
+) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+    selected_ids = set()
+
+    def pick_best(predicate, max_picks=1):
+        cand = [s for s in all_services if s['id'] not in selected_ids and predicate(s)]
+        if not cand:
+            return
+        cand.sort(
+            key=lambda x: (x.get('priority_score', 0) * 0.6 + x.get('popularity_score', 0) * 0.4),
+            reverse=True
+        )
+        for i in range(min(max_picks, len(cand))):
+            selected.append(cand[i])
+            selected_ids.add(cand[i]['id'])
+
+    # Phase 1: Assessment — prefer NCI FitCheck Starter, then other NCI FitCheck, then any FitCheck
+    if needs['needs_assessment']:
+        pick_best(lambda s: 'fitcheck' in s.get('service_name','').lower()
+                           and s.get('product_family') == 'NCI'
+                           and 'starter' in s.get('service_name','').lower(), 1)
+        if not selected:
+            pick_best(lambda s: 'fitcheck' in s.get('service_name','').lower()
+                               and s.get('product_family') == 'NCI', 1)
+        if not selected:
+            pick_best(lambda s: 'fitcheck' in s.get('service_name','').lower(), 1)
+
+    # Phase 2: Deployment — prefer "Infrastructure Deployment" then "Infrastructure Expansion"
+    if needs['needs_deployment']:
+        picked_before = len(selected)
+        pick_best(lambda s: s.get('product_family') == 'NCI'
+                           and 'infrastructure deployment' in s.get('service_name','').lower(), 1)
+        if len(selected) == picked_before:
+            pick_best(lambda s: s.get('product_family') == 'NCI'
+                               and 'infrastructure expansion' in s.get('service_name','').lower(), 1)
+
+    # Phase 3: Migration — prefer Nutanix Move
+    if needs['needs_migration']:
+        pick_best(lambda s: s.get('service_type') == 'migration'
+                           and 'move' in s.get('service_name','').lower(), 1)
+        if scope.get('source_platform') == 'cisco_hyperflex':
+            pick_best(lambda s: 'hyperflex' in s.get('service_name','').lower(), 1)
+
+    return selected[:max(1, limit)]
+
+
+# ============== planner API ==============
 
 def plan_suggestions(req: SuggestPlanRequest):
-    # Build query text from requirement + BOQ + providers + vendor + deployment + industry
-    boq_text = " ".join([f"{getattr(b,'sku',None) or ''} {getattr(b,'description',None) or ''} {getattr(b,'vendor',None) or ''}".strip()
-                         for b in (req.boq or [])])
-    providers_text = " ".join(req.providers or [])
-    vendor_cue = req.selected_vendor or ""
-    dep_text = req.deployment_type or ""
-    industry_text = req.industry or ""
+    scope = _extract_scope_details(req)
+    needs = _detect_service_needs(req, scope)
 
+    providers_txt = " ".join(req.providers or [])
+    meta_txt = f"{req.deployment_type or ''} {req.industry or ''} {req.proposal_type or ''}".strip()
+    boq_txt = " ".join([f"{b.sku or ''} {b.description or ''} {b.vendor or ''}" for b in (req.boq or [])])
     query_text = " ".join([
         req.requirements_text or "",
-        boq_text,
-        providers_text,
-        vendor_cue,
-        dep_text,
-        industry_text,
+        boq_txt,
+        providers_txt,
+        req.selected_vendor or "",
+        meta_txt
     ]).strip()
 
-    # Intent + phases
-    intent_info = classify_intent(req.requirements_text or "", (req.boq or []))
-    phases = generate_phase_plan(intent_info)
+    platforms = req.constraints.target_platforms or None
+    families = req.constraints.product_families or ["NDB", "NCI", "NC2", "NKP", "NUS"]
 
-    # Constraints and defaults
-    platforms = req.constraints.target_platforms or _deployment_to_platforms(req.deployment_type)
-    families_from_ui = req.constraints.product_families or []
-    families_hint = intent_info.get("families_hint") or []
-    families = families_from_ui or families_hint or ["NDB", "NCI", "NC2", "NKP", "NUS"]
-    prefer_mig = bool(req.constraints.prefer_migration_ready)
+    candidates: List[Dict[str, Any]] = []
+
+    def _pull(fam: str, service_type: str | None, q: str | None):
+        rows = suggest_services_repo(
+            product_family=fam,
+            platforms=platforms,
+            limit=30,
+            service_type=service_type,
+            q=q,
+        )
+        candidates.extend(rows)
+
+    # targeted pulls based on detected needs
+    for fam in families:
+        if needs['needs_assessment']:
+            _pull(fam, None, 'fitcheck')
+        if needs['needs_deployment']:
+            _pull(fam, 'deployment', 'infrastructure')
+        if needs['needs_migration']:
+            _pull(fam, 'migration', None)
+            if scope['source_platform'] == 'cisco_hyperflex':
+                _pull(fam, 'migration', 'hyperflex')
+        if needs['needs_db_migration']:
+            _pull('NDB', 'migration', 'database')
+
+    # dedupe
+    uniq: Dict[int, Dict[str, Any]] = {}
+    for r in candidates:
+        uniq[r["id"]] = r
+    all_services = list(uniq.values())
+
+    # score
+    scored: List[Tuple[float, List[str], Dict[str, Any]]] = []
+    for svc in all_services:
+        rel_score, reasons = _calculate_relevance_score(svc, needs, scope, query_text)
+        base_score = svc.get('priority_score', 0) * 0.3 + svc.get('popularity_score', 0) * 0.2
+        final_score = base_score + rel_score
+        scored.append((final_score, reasons, svc))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # include/exclude filters
     must_inc = req.constraints.must_include or []
     must_exc = req.constraints.must_exclude or []
-
-    # Phase-wise fetch
-    candidates_all: List[Dict[str, Any]] = []
-    fetched_debug: Dict[str, int] = {}
-    per_family_cap = max(10, req.limit * 3)
-
-    for ph in phases:
-        rows = _fetch_candidates_for_phase(
-            phase=ph,
-            families=families,
-            platforms=platforms,
-            prefer_mig=prefer_mig,
-            per_family_cap=per_family_cap
-        )
-        fetched_debug[f"phase_{ph.get('name','unknown')}"] = len(rows)
-        candidates_all.extend(rows)
-
-    # Dedupe
-    uniq: Dict[int, Dict[str, Any]] = {r["id"]: r for r in candidates_all}
-    uniq_rows = list(uniq.values())
-
-    # Flags for boosts
-    q_tokens = set(_tokenize(query_text))
-    wants_dr = any(t in q_tokens for t in {"dr", "disaster", "recovery", "disaster recovery", "metro", "witness", "protection", "protection domain", "nearsync", "near sync", "sync"})
-    wants_migration = any(t in q_tokens for t in {"migrate", "migration", "move", "vmware", "vmware to nutanix", "oracle", "postgres"})
-
-    # Score
-    ranked = score_results(
-        query=query_text,
-        rows=uniq_rows,
-        top_k=max(req.limit * 3, 20),
-        wants_dr=wants_dr,
-        wants_migration=wants_migration
-    )
-
-    # Include/exclude and provider bias
-    filtered: List[Tuple[float, str, Dict[str, Any]]] = []
-    provider_tokens = [p.lower() for p in (req.providers or []) if p] + ([vendor_cue.lower()] if vendor_cue else [])
-    for score, why, r in ranked:
-        namecat = f"{r.get('service_name','')} {r.get('category_name','')}"
-        if must_inc and not _contains_any(namecat, must_inc):
+    filtered: List[Tuple[float, List[str], Dict[str, Any]]] = []
+    for score, reasons, svc in scored:
+        namecat = f"{svc.get('service_name','')} {svc.get('category_name','')}".lower()
+        if must_inc and not any(inc.lower() in namecat for inc in must_inc):
             continue
-        if must_exc and _contains_any(namecat, must_exc):
+        if must_exc and any(exc.lower() in namecat for exc in must_exc):
             continue
+        filtered.append((score, reasons, svc))
 
-        hay = " ".join([r.get("service_name",""), r.get("positioning","")]).lower()
-        if provider_tokens and any(p in hay for p in provider_tokens):
-            score += 0.05
-            why = f"{why}, provider_bias"
+    # minimal set via phase chooser
+    core_services = _select_core_services([s[2] for s in filtered], needs, scope, limit=max(3, req.limit))
 
-        filtered.append((score, why, r))
+    # LLM refinement (keep within shortlist)
+    llm_ids = llm_pick_services(
+        query_text=query_text,
+        providers=list(req.providers or []),
+        shortlist_rows=[s[2] for s in filtered[:40]],
+        limit=max(3, req.limit),
+        required_platforms=(req.constraints.target_platforms or []),
+        allowed_families=families,
+        scope_context={
+            'vm_count': scope['vm_count'],
+            'node_count': scope['node_count'],
+            'source_platform': scope['source_platform'],
+            'needs_migration': needs['needs_migration'],
+            'needs_deployment': needs['needs_deployment'],
+        }
+    ) or []
 
-    topN = filtered[: req.limit]
+    # if LLM returns something, respect its order
+    chosen_ids = [svc['id'] for svc in core_services]
+    if llm_ids:
+        id_to_svc = {svc['id']: svc for svc in [s[2] for s in filtered]}
+        chosen_ids = [i for i in llm_ids if i in id_to_svc]
+        # ensure at least minimal set if LLM returned fewer than 3
+        if len(chosen_ids) < 3:
+            for svc in core_services:
+                if svc['id'] not in chosen_ids:
+                    chosen_ids.append(svc['id'])
+                if len(chosen_ids) >= 3:
+                    break
 
-    # Marshal
+    # final assembly, cap to exactly 3 items
+    final_ids = chosen_ids[:3]
+    id_to_scored = {s[2]['id']: (s[0], s[1], s[2]) for s in filtered}
+    final_triples: List[Tuple[float, List[str], Dict[str, Any]]] = []
+    for sid in final_ids:
+        if sid in id_to_scored:
+            final_triples.append(id_to_scored[sid])
+
+    # map to response
     items: List[RankedService] = []
-    for score, why, r in topN:
+    for score, reasons, svc in final_triples:
+        phase_tag = ''
+        if 'fitcheck' in (svc.get('service_name','').lower()):
+            phase_tag = 'Kickoff / Assessment & Planning'
+        elif svc.get('service_type') == 'deployment':
+            phase_tag = 'Infrastructure Setup'
+        elif svc.get('service_type') == 'migration':
+            phase_tag = 'Data Migration'
+
+        reason_str = " | ".join(reasons) if reasons else "Relevant to scope"
+        if phase_tag:
+            reason_str = f"[{phase_tag}] " + reason_str
+
         items.append(RankedService(
-            id=r["id"],
-            service_name=r["service_name"],
-            category_name=r["category_name"],
-            product_family=r["product_family"],
-            score=round(float(score), 6),
-            reason=why,
-            duration_days=int(r.get("duration_days") or 0),
-            price_man_day=float(r.get("price_man_day") or 0.0),
-            service_type=r.get("service_type"),
-            supports_db_migration=bool(r.get("supports_db_migration") or False),
-            target_platforms=list(r.get("target_platforms") or []),
-            canonical_names=list(r.get("canonical_names") or []),
-            popularity_score=float(r.get("popularity_score") or 0.0),
-            priority_score=float(r.get("priority_score") or 0.0),
+            id=svc["id"],
+            service_name=svc["service_name"],
+            category_name=svc["category_name"],
+            product_family=svc["product_family"],
+            score=round(float(score), 3),
+            reason=reason_str,
+            duration_days=int(svc["duration_days"]),
+            price_man_day=float(svc["price_man_day"]),
+            service_type=svc.get("service_type"),
+            supports_db_migration=bool(svc.get("supports_db_migration") or False),
+            target_platforms=list(svc.get("target_platforms") or []),
+            canonical_names=list(svc.get("canonical_names") or []),
+            popularity_score=float(svc.get("popularity_score") or 0.0),
+            priority_score=float(svc.get("priority_score") or 0.0),
         ))
 
     debug = {
         "query_text": query_text,
-        "requested_platforms": platforms or [],
-        "requested_families": families,
-        "supports_db_migration": prefer_mig,
-        "flags": {"wants_dr": wants_dr, "wants_migration": wants_migration},
-        "fetched_batches": fetched_debug,
-        "candidates_total": len(candidates_all),
-        "unique_after_dedupe": len(uniq_rows),
-        "providers": req.providers,
-        "deployment_type": req.deployment_type,
-        "industry": req.industry,
-        "proposal_type": req.proposal_type,
+        "scope": scope,
+        "needs": needs,
+        "candidates_fetched": len(candidates),
+        "unique_services": len(all_services),
+        "services_suggested": len(items),
     }
+
     return items, debug

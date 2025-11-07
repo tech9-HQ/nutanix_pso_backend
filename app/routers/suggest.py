@@ -1,6 +1,7 @@
 # app/routers/suggest.py
 from typing import List, Optional
 from fastapi import APIRouter, Query
+
 from app.models.schemas import (
     SuggestResponse,
     ServiceItem,
@@ -8,9 +9,11 @@ from app.models.schemas import (
     SuggestPlanResponse,
 )
 from app.services.proposals_repo import suggest_services_repo
-from app.services.ranker import plan_suggestions  # make sure this exists
+from app.services.ranker import plan_suggestions
+from app.services.journey import make_journey  # <-- add
 
 router = APIRouter(prefix="/suggest", tags=["suggest"])
+
 
 @router.get("/services", response_model=SuggestResponse)
 def suggest_services(
@@ -52,7 +55,18 @@ def suggest_services(
 
     return SuggestResponse(count=len(items), items=items)
 
+
 @router.post("/plan", response_model=SuggestPlanResponse)
 def suggest_plan(req: SuggestPlanRequest) -> SuggestPlanResponse:
     items, debug = plan_suggestions(req)
-    return SuggestPlanResponse(count=len(items), items=items, debug=debug)
+
+    # Build phase-wise journey based on selected services
+    journey = make_journey([i.model_dump() for i in items])  # if Pydantic v2
+
+    # Return items + journey + debug
+    return SuggestPlanResponse(
+        count=len(items),
+        items=items,
+        journey=journey,   # <-- new field
+        debug=debug,
+    )
