@@ -1,0 +1,27 @@
+@"
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+.DS_Store
+*.log
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+
+# Local data or generated files
+generated_docs/
+*.docx
+*.pdf
+*.json
+*.csv
+
+# System
+Thumbs.db
+.vscode/
+"@ | Out-File -Encoding utf8 .gitignore
