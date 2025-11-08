@@ -1,7 +1,9 @@
 # app/services/proposals_repo.py
+from __future__ import annotations
 from typing import List, Dict, Any, Optional
 from supabase import create_client, Client
 from app.config import get_settings
+from urllib.parse import quote_plus
 import re
 
 _s = get_settings()
@@ -13,14 +15,39 @@ _FIELDS = (
     "priority_score,popularity_score,product_family"
 )
 
+# Broad synonym packs used by the ranker labels
+TERM_PACKS: Dict[str, List[str]] = {
+    "fitcheck": [
+        "fitcheck", "assessment", "health check", "discovery", "sizing",
+        "evaluation", "design workshop", "readiness"
+    ],
+    "infra": [
+        "infrastructure", "cluster", "deployment", "commission", "expansion",
+        "rack and stack", "configure", "setup", "build"
+    ],
+    "migration": [
+        "migration", "migrate", "move", "relocate", "cutover",
+        "vmware", "vsphere", "hyperflex", "source to nc2", "lift and shift"
+    ],
+    "database": [
+        "database", "db", "ndb", "data services", "sql", "oracle",
+        "postgres", "mysql", "mongodb", "schema migration"
+    ],
+    "dr": [
+        "dr", "disaster", "recovery", "data protection", "protection domain",
+        "protection domains", "replication", "metro availability", "metro",
+        "leap", "site failover", "failback"
+    ],
+}
+
 STOPWORDS = {
     "the","and","for","with","from","into","on","to","of","a","an","in",
     "by","is","are","be","need","needs","this","that","it","as","or"
 }
 
-def _safe_tokens(text: str, max_tokens: int = 12) -> list[str]:
+def _safe_tokens(text: str, max_tokens: int = 12) -> List[str]:
     toks = re.findall(r"[a-z0-9]+", (text or "").lower())
-    out: list[str] = []
+    out: List[str] = []
     for t in toks:
         if t in STOPWORDS:
             continue
@@ -29,6 +56,69 @@ def _safe_tokens(text: str, max_tokens: int = 12) -> list[str]:
         if len(out) >= max_tokens:
             break
     return out
+
+# add near top
+from urllib.parse import quote_plus
+
+# add this function anywhere in module
+def build_or_ilike(keys: list[str], columns: list[str]) -> str:
+    parts = []
+    for k in keys:
+        if not k: 
+            continue
+        like = f"%{quote_plus(k)}%"
+        for col in columns:
+            if col.endswith(".ov"):
+                parts.append(f"{col}.%7B{quote_plus(k)}%7D")
+            else:
+                parts.append(f"{col}.ilike.{like}")
+    return f"({','.join(parts)})" if parts else ""
+
+def fetch_candidates_smart(
+    sb_url: str,
+    sb_key: str,
+    table: str,
+    product_family: str,
+    platform_bucket: str,      # 'azure' | 'aws' | 'ahv' | 'null' | 'other'
+    or_filter: str,
+    limit: int = 100,
+):
+    sel = ",".join([
+        "id","category_name","service_name","positioning","duration_days","price_man_day",
+        "canonical_names","service_type","supports_db_migration","target_platforms",
+        "priority_score","popularity_score","product_family","embedding"
+    ])
+    params = {
+        "select": sel,
+        "product_family": f"eq.{product_family}",
+        "order": "priority_score.desc.nullslast,popularity_score.desc.nullslast,duration_days.asc.nullsfirst",
+        "limit": str(limit)
+    }
+    if platform_bucket == "null":
+        params["target_platforms"] = "is.null"
+    elif platform_bucket == "other":
+        params["target_platforms"] = "not.ov.%7Bahv,aws,azure%7D"
+    else:
+        params["target_platforms"] = f"ov.%7B{platform_bucket}%7D"
+    if or_filter:
+        params["or"] = or_filter
+
+    url = f"{sb_url.rstrip('/')}/rest/v1/{table}"
+    headers = {"apikey": sb_key, "Authorization": f"Bearer {sb_key}"}
+    with httpx.Client(timeout=httpx.Timeout(10.0, read=20.0)) as cx:
+        r = cx.get(url, headers=headers, params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+def _expand_query_terms(q: Optional[str]) -> List[str]:
+    if not q:
+        return []
+    key = q.strip().lower()
+    if key in TERM_PACKS:
+        return TERM_PACKS[key]
+    # fallback: tokenize free text
+    return _safe_tokens(key, max_tokens=12)
 
 def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
     r["price_man_day"] = float(r.get("price_man_day") or 0)
@@ -58,18 +148,21 @@ def _apply_exact_filters(qb, *,
         qb = qb.lte("price_man_day", price_cap)
     return qb
 
-def _apply_text_search(qb, q: Optional[str]):
-    if not q:
+def _apply_text_search_multi(qb, terms: List[str]):
+    """
+    Build a single OR() across service_name, positioning, product_family, canonical_names
+    for all provided terms. Uses ilike on text fields and ov on canonical_names array.
+    """
+    if not terms:
         return qb
-    tokens = _safe_tokens(q)
-    if not tokens:
-        return qb
-    ors = []
-    for t in tokens:
-        ors.append(f"service_name.ilike.%{t}%")
-        ors.append(f"positioning.ilike.%{t}%")
-        ors.append(f"product_family.ilike.%{t}%")
-        ors.append(f"canonical_names.ov.{{{t}}}")
+    ors: List[str] = []
+    for t in terms:
+        t_esc = t.replace(",", " ")  # guard commas
+        ors.append(f"service_name.ilike.%{t_esc}%")
+        ors.append(f"positioning.ilike.%{t_esc}%")
+        ors.append(f"product_family.ilike.%{t_esc}%")
+        # canonical_names is text[]; ov checks membership
+        ors.append(f"canonical_names.ov.{{{t_esc}}}")
     return qb.or_(",".join(ors))
 
 def _order_and_limit(qb, limit: int):
@@ -89,10 +182,41 @@ def _py_sort(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         )
     return sorted(rows, key=key)
 
+def _dedupe_keep_best(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    best: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        rid = r["id"]
+        prev = best.get(rid)
+        if not prev:
+            best[rid] = r
+            continue
+        # keep higher priority/popularity and shorter duration
+        cur_key = (r.get("priority_score", 0.0), r.get("popularity_score", 0.0), -(r.get("duration_days") or 1e9))
+        prev_key = (prev.get("priority_score", 0.0), prev.get("popularity_score", 0.0), -(prev.get("duration_days") or 1e9))
+        if cur_key > prev_key:
+            best[rid] = r
+    return list(best.values())
+
 def get_all_proposals() -> List[Dict[str, Any]]:
     resp = _supabase.table("proposals_updated").select(_FIELDS).execute()
     rows: List[Dict[str, Any]] = getattr(resp, "data", []) or []
     return [_normalize_row(r) for r in rows]
+
+def _base_qb(product_family: Optional[str],
+             service_type: Optional[str],
+             supports_db_migration: Optional[bool],
+             max_duration: Optional[int],
+             price_cap: Optional[float]):
+    qb = _supabase.table("proposals_updated").select(_FIELDS)
+    qb = _apply_exact_filters(
+        qb,
+        product_family=product_family,
+        service_type=service_type,
+        supports_db_migration=supports_db_migration,
+        max_duration=max_duration,
+        price_cap=price_cap,
+    )
+    return qb
 
 def suggest_services_repo(
     product_family: Optional[str],
@@ -104,76 +228,64 @@ def suggest_services_repo(
     price_cap: Optional[float] = None,
     q: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    """
+    Broad, synonym-aware fetch. Runs three buckets for platform:
+    1) target_platforms overlaps requested platforms
+    2) target_platforms IS NULL
+    3) target_platforms NOT overlaps {ahv,aws,azure}  (mis-tagged)
+    For text search, expands q via TERM_PACKS and ORs all terms across fields.
+    Falls back to no-text search if zero rows.
+    """
+    q_terms = _expand_query_terms(q)
 
-    # No platform filter -> single query
-    if not platforms:
-        qb = _supabase.table("proposals_updated").select(_FIELDS)
-        qb = _apply_exact_filters(
-            qb,
-            product_family=product_family,
-            service_type=service_type,
-            supports_db_migration=supports_db_migration,
-            max_duration=max_duration,
-            price_cap=price_cap,
-        )
-        qb = _apply_text_search(qb, q)
+    def run_one(qb_builder, terms: List[str]) -> List[Dict[str, Any]]:
+        qb = qb_builder()
+        qb = _apply_text_search_multi(qb, terms)
         qb = _order_and_limit(qb, limit)
-        resp = qb.execute()
-        rows: List[Dict[str, Any]] = getattr(resp, "data", []) or []
-        return [_normalize_row(r) for r in rows]
+        data = getattr(qb.execute(), "data", []) or []
+        return data
 
-    # Platform filter present -> do 3 queries and merge
+    rows: List[Dict[str, Any]] = []
 
-    # Q1: overlap with requested platforms
-    qb1 = _supabase.table("proposals_updated").select(_FIELDS)
-    qb1 = _apply_exact_filters(
-        qb1,
-        product_family=product_family,
-        service_type=service_type,
-        supports_db_migration=supports_db_migration,
-        max_duration=max_duration,
-        price_cap=price_cap,
-    )
-    qb1 = qb1.overlaps("target_platforms", platforms)
-    qb1 = _apply_text_search(qb1, q)
-    qb1 = _order_and_limit(qb1, limit)
-    r1 = getattr(qb1.execute(), "data", []) or []
+    # === No platform filter ===
+    if not platforms:
+        def builder():
+            return _base_qb(product_family, service_type, supports_db_migration, max_duration, price_cap)
+        rows.extend(run_one(builder, q_terms))
+        if not rows and q_terms:
+            # fallback breadth without keyword constraint
+            rows.extend(run_one(builder, []))
+        return _py_sort([_normalize_row(r) for r in _dedupe_keep_best(rows)])[:limit]
+
+    # === Platform filter present: run three buckets ===
+    ALL_PLATFORMS = ["ahv", "aws", "azure"]
+
+    # Q1: overlaps requested platforms
+    def b1():
+        qb = _base_qb(product_family, service_type, supports_db_migration, max_duration, price_cap)
+        return qb.overlaps("target_platforms", platforms)
 
     # Q2a: target_platforms IS NULL
-    qb2a = _supabase.table("proposals_updated").select(_FIELDS)
-    qb2a = _apply_exact_filters(
-        qb2a,
-        product_family=product_family,
-        service_type=service_type,
-        supports_db_migration=supports_db_migration,
-        max_duration=max_duration,
-        price_cap=price_cap,
-    )
-    qb2a = qb2a.is_("target_platforms", 'null')
-    qb2a = _apply_text_search(qb2a, q)
-    qb2a = _order_and_limit(qb2a, limit)
-    r2a = getattr(qb2a.execute(), "data", []) or []
+    def b2a():
+        qb = _base_qb(product_family, service_type, supports_db_migration, max_duration, price_cap)
+        return qb.is_("target_platforms", "null")
 
-    # Q2b: NOT OVERLAPS any known platforms
-    ALL_PLATFORMS = ["ahv", "aws", "azure"]
-    qb2b = _supabase.table("proposals_updated").select(_FIELDS)
-    qb2b = _apply_exact_filters(
-        qb2b,
-        product_family=product_family,
-        service_type=service_type,
-        supports_db_migration=supports_db_migration,
-        max_duration=max_duration,
-        price_cap=price_cap,
-    )
-    qb2b = qb2b.not_.overlaps("target_platforms", ALL_PLATFORMS)
-    qb2b = _apply_text_search(qb2b, q)
-    qb2b = _order_and_limit(qb2b, limit)
-    r2b = getattr(qb2b.execute(), "data", []) or []
+    # Q2b: NOT OVERLAPS any known platforms (catches dirty data)
+    def b2b():
+        qb = _base_qb(product_family, service_type, supports_db_migration, max_duration, price_cap)
+        return qb.not_.overlaps("target_platforms", ALL_PLATFORMS)
 
-    # Merge + dedupe by id, sort, trim
-    merged: Dict[int, Dict[str, Any]] = {}
-    for r in (r1 + r2a + r2b):
-        merged[r["id"]] = r
-    rows = [_normalize_row(v) for v in merged.values()]
+    # Run with terms first
+    rows.extend(run_one(b1, q_terms))
+    rows.extend(run_one(b2a, q_terms))
+    rows.extend(run_one(b2b, q_terms))
+
+    # Fallback breadth if nothing matched
+    if not rows and q_terms:
+        rows.extend(run_one(b1, []))
+        rows.extend(run_one(b2a, []))
+        rows.extend(run_one(b2b, []))
+
+    rows = [_normalize_row(r) for r in _dedupe_keep_best(rows)]
     rows = _py_sort(rows)[:limit]
     return rows

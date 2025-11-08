@@ -1,247 +1,242 @@
 # app/services/duration_estimator.py
 from __future__ import annotations
-import os, json, logging, requests
-from typing import List, Dict, Any, Optional
+import os, json, logging, re, requests
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("duration_estimator")
 
-# -------- ENV --------
-# Preferred path
-GEMINI_ENDPOINT = os.getenv("GEMINI_ENDPOINT", "").rstrip("/")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
-SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "serper").lower()
+# --- ENVIRONMENT VARIABLES ---
+SERPER_API_KEY   = os.getenv("SERPER_API_KEY", "")
+SEARCH_PROVIDER  = (os.getenv("SEARCH_PROVIDER", "serper") or "serper").lower()
 
-# Fallback path (Azure)
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT", "").rstrip("/")
+# Gemini fallback
+GEMINI_ENDPOINT  = os.getenv("GEMINI_ENDPOINT", "https://generativelanguage.googleapis.com").rstrip("/")
+GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
+
+# Azure primary provider
+AZURE_ENDPOINT   = os.getenv("AZURE_ENDPOINT", "").rstrip("/")
 AZURE_DEPLOYMENT = os.getenv("AZURE_DEPLOYMENT", "")
-AZURE_API_KEY = os.getenv("AZURE_API_KEY", "")
-AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-10-01")
+AZURE_API_KEY    = os.getenv("AZURE_API_KEY", "")
+LLM_PROVIDER     = (os.getenv("LLM_PROVIDER", "azure") or "azure").lower()
 
-# -------- Helpers: search --------
-def _serper_search(q: str, max_results: int = 6) -> List[Dict[str, Any]]:
-    if not SERPER_API_KEY:
-        log.info("serper api key missing")
-        return []
-    url = "https://google.serper.dev/search"
-    payload = {"q": q, "num": max_results}
-    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
-    if r.status_code >= 400:
-        log.warning("serper search http %s: %s", r.status_code, r.text[:200])
-        return []
-    data = r.json()
-    results = (data.get("organic") or []) + (data.get("knowledgeGraph") or [])
-    out = []
-    for it in results[:max_results]:
-        out.append({
-            "title": it.get("title") or it.get("name") or "",
-            "url": it.get("link") or it.get("url") or "",
-            "content": it.get("snippet") or it.get("description") or "",
-        })
-    return out
+LLM_CONNECT_TIMEOUT = int(os.getenv("LLM_CONNECT_TIMEOUT", "15"))
+LLM_READ_TIMEOUT    = int(os.getenv("LLM_READ_TIMEOUT", "180"))
 
-def _web_snippets(query: str, max_results: int = 6) -> List[Dict[str, Any]]:
-    try:
-        if SEARCH_PROVIDER == "serper":
-            res = _serper_search(query, max_results=max_results)
-            log.info("search provider=serper, hits=%d", len(res))
-            return res
-        # default to serper anyway
-        res = _serper_search(query, max_results=max_results)
-        log.info("search provider=default-serper, hits=%d", len(res))
-        return res
-    except Exception as e:
-        log.warning("web search failed: %s", e)
-        return []
 
-# -------- Helpers: LLM --------
-def _azure_chat(messages: List[Dict[str, str]], max_tokens: int = 200, timeout_s: int = 25) -> str:
-    if not (AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_KEY):
-        raise RuntimeError("Azure LLM env not set")
-    url = f"{AZURE_ENDPOINT}/chat/completions?api-version={AZURE_API_VERSION}"
-    body = {
-        "model": AZURE_DEPLOYMENT,
-        "messages": messages,
-        "temperature": 0.0,
-        "max_tokens": max_tokens,
-        "top_p": 1.0,
-    }
-    headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
-    r = requests.post(url, headers=headers, json=body, timeout=timeout_s)
-    r.raise_for_status()
-    data = r.json()
-    return data["choices"][0]["message"]["content"]
-
-def _gemini_estimate(prompt: str, max_output_tokens: int = 256, timeout_s: int = 25) -> str:
-    """
-    Minimal REST call for non-streaming generateContent.
-    """
-    if not (GEMINI_ENDPOINT and GEMINI_API_KEY and GEMINI_MODEL):
-        raise RuntimeError("Gemini env not set")
-    url = f"{GEMINI_ENDPOINT}/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    body = {
-        "contents": [
-            {"parts": [{"text": prompt}]}
-        ],
-        "generationConfig": {
-            "temperature": 0.0,
-            "maxOutputTokens": max_output_tokens,
-            "topP": 1.0,
-            "topK": 1
-        }
-    }
-    r = requests.post(url, json=body, timeout=timeout_s)
-    if r.status_code >= 400:
-        raise RuntimeError(f"gemini http {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    # Extract text
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception:
-        log.warning("gemini unexpected payload: %s", json.dumps(data)[:400])
-        return ""
-
-# -------- Prompts --------
-_SYSTEM = (
-    "You are a professional services estimator. Given a task description and a few web snippets, "
-    "output ONLY a JSON object with an integer field 'days' estimating the typical effort "
-    "in business days for a senior consultant team. Prefer conservative but realistic estimates. "
-    "No text besides the JSON."
-)
-
-_USER_TMPL = """Task:
-{task}
-
-Context:
-- Client industry: {industry}
-- Deployment type: {deploy_type}
-- Source platform: {source}
-- Target platform: {target}
-- VM count: {vms}
-- Nodes: {nodes}
-
-Evidence (snippets):
-{snippets}
-
-Rules:
-- Consider planning, execution, validation, and basic handover.
-- If range, return the upper bound as an integer.
-- If not enough info, infer from similar scope in the snippets.
-
-Return:
-{{"days": <integer>}}
-"""
-
-def _build_prompt(*, task_text: str, industry: Optional[str], deployment_type: Optional[str],
-                  source_platform: Optional[str], target_platform: Optional[str],
-                  vm_count: Optional[int], node_count: Optional[int],
-                  snippets: List[Dict[str, Any]]) -> str:
-    snip_txt = "\n".join([
-        f"- {s.get('title') or ''}: {s.get('content') or ''} (src: {s.get('url') or ''})"[:400]
-        for s in snippets
-    ])[:1800] or "- no external snippets found"
-    return _USER_TMPL.format(
-        task=(task_text or "")[:500],
-        industry=industry or "unspecified",
-        deploy_type=deployment_type or "unspecified",
-        source=source_platform or "unspecified",
-        target=target_platform or "unspecified",
-        vms=vm_count or 0,
-        nodes=node_count or 0,
-        snippets=snip_txt
-    )
-
-# -------- Public API --------
-def estimate_days_from_web(
-    *,
-    task_text: str,
-    industry: Optional[str],
-    deployment_type: Optional[str],
-    source_platform: Optional[str],
-    target_platform: Optional[str],
-    vm_count: Optional[int],
-    node_count: Optional[int],
-    search_hints: List[str] | None = None,
-) -> Optional[int]:
-    """
-    Search the web and ask an LLM to output {"days": <int>}.
-    Primary: Serper + Gemini. Fallback: Azure if Gemini env missing.
-    """
-    try:
-        # Build query
-        q_parts = [task_text or ""]
-        if industry: q_parts.append(industry)
-        if deployment_type: q_parts.append(deployment_type)
-        if source_platform: q_parts.append(source_platform)
-        if target_platform: q_parts.append(target_platform)
-        if vm_count: q_parts.append(f"{vm_count} VMs")
-        if node_count: q_parts.append(f"{node_count} nodes")
-        if search_hints: q_parts.extend(search_hints)
-        query = " ".join([p for p in q_parts if p]).strip()
-
-        snippets = _web_snippets(query, max_results=6)
-        log.info("duration_estimator: query='%s' snippets=%d", query, len(snippets))
-
-        user_prompt = _build_prompt(
-            task_text=task_text,
-            industry=industry,
-            deployment_type=deployment_type,
-            source_platform=source_platform,
-            target_platform=target_platform,
-            vm_count=vm_count,
-            node_count=node_count,
-            snippets=snippets
-        )
-
-        # Prefer Gemini; fallback to Azure if Gemini not configured
-        if GEMINI_ENDPOINT and GEMINI_API_KEY and GEMINI_MODEL:
-            content = _gemini_estimate(prompt=f"{_SYSTEM}\n\n{user_prompt}", max_output_tokens=128, timeout_s=30)
-            if not content:
-                log.info("gemini returned empty content")
-        else:
-            log.info("gemini env missing, falling back to azure")
-            content = _azure_chat(
-                messages=[{"role": "system", "content": _SYSTEM},
-                          {"role": "user", "content": user_prompt}],
-                max_tokens=120,
-                timeout_s=30
-            )
-
-        # Parse JSON
-        raw_preview = (content or "").strip()
-        log.info("duration_estimator raw LLM: %s", raw_preview[:200].replace("\n", " "))
-        start = raw_preview.find("{")
-        end = raw_preview.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            log.warning("Estimator LLM did not return JSON. content=%s", raw_preview[:400])
-            return None
-
-        obj = json.loads(raw_preview[start:end+1])
-        days = obj.get("days", None)
-        try:
-            days_i = int(days)
-            if days_i <= 0:
-                return None
-            return min(days_i, 365)
-        except Exception:
-            log.warning("Estimator JSON non-integer days: %r", days)
-            return None
-
-    except Exception as e:
-        log.warning("estimate_days_from_web failed: %s", e)
+# -------------------------------------------------------------------------
+#  LLM CALL HANDLER
+# -------------------------------------------------------------------------
+def call_llm(prompt: str, *, max_tokens: int = 400, temperature: float = 0.0) -> Optional[str]:
+    """Call Azure (preferred) or Gemini fallback."""
+    if not prompt:
         return None
 
+    # --- Azure route ---
+    if LLM_PROVIDER in ("azure", "ms", "microsoft"):
+        if not (AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_KEY):
+            log.warning("Azure configuration missing, skipping LLM call")
+            return None
+        try:
+            url = f"{AZURE_ENDPOINT}/chat/completions"
+            headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+            payload = {
+                "model": AZURE_DEPLOYMENT,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": float(temperature),
+                "max_tokens": int(min(max_tokens, 800)),
+                "stream": False,
+            }
+            log.info("Calling Azure Chat Completions: %s (model=%s)", url, AZURE_DEPLOYMENT)
+            resp = requests.post(
+                url, headers=headers, json=payload,
+                timeout=(LLM_CONNECT_TIMEOUT, LLM_READ_TIMEOUT)
+            )
+            if resp.status_code == 429:
+                log.warning("Azure rate limit 429")
+                return None
+            if resp.status_code >= 400:
+                log.error(f"Azure LLM error {resp.status_code}: {resp.text[:300]}")
+                return None
+            data = resp.json()
+            return (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        except Exception as e:
+            log.error(f"Azure LLM call failed: {e}")
+            return None
+
+    # --- Gemini fallback route ---
+    if GEMINI_API_KEY:
+        try:
+            url = f"{GEMINI_ENDPOINT}/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+            body = {"contents": [{"parts": [{"text": prompt}]}]}
+            r = requests.post(url, json=body, timeout=(LLM_CONNECT_TIMEOUT, LLM_READ_TIMEOUT))
+            if r.status_code >= 400:
+                log.error(f"Gemini error {r.status_code}: {r.text[:300]}")
+                return None
+            jr = r.json()
+            return ((jr.get("candidates") or [{}])[0].get("content") or {}).get("parts", [{}])[0].get("text", "")
+        except Exception as e:
+            log.error(f"Gemini LLM call failed: {e}")
+            return None
+
+    log.warning("No LLM provider configured")
+    return None
+
+
+# -------------------------------------------------------------------------
+#  SERPER WEB SEARCH
+# -------------------------------------------------------------------------
+def _serper_search(q: str, num: int = 6) -> List[str]:
+    """Query Serper and return text snippets."""
+    if not SERPER_API_KEY:
+        log.warning("SERPER_API_KEY not configured, skipping search")
+        return []
+    url = "https://google.serper.dev/search"
+    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+    body = {"q": q, "num": max(1, min(num, 10))}
+
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        snippets: List[str] = []
+        for grp in ("knowledgeGraph", "answerBox", "organic", "peopleAlsoAsk", "topStories"):
+            items = data.get(grp)
+            if isinstance(items, dict):
+                for v in items.values():
+                    if isinstance(v, str):
+                        snippets.append(v)
+            elif isinstance(items, list):
+                for it in items:
+                    for key in ("snippet", "title", "answer", "description"):
+                        val = it.get(key)
+                        if isinstance(val, str) and val:
+                            snippets.append(val)
+        log.info(f"Serper search returned {len(snippets)} snippets for: {q[:80]}")
+        return snippets[:10]
+    except Exception as e:
+        log.error(f"Serper search failed: {e}")
+        return []
+
+
+# -------------------------------------------------------------------------
+#  MAIN AI ESTIMATOR
+# -------------------------------------------------------------------------
+def estimate_days_ai(service_name: str, *, context: Dict[str, Any]) -> Optional[int]:
+    """
+    Estimate delivery duration (in days) using LLM and optional web search.
+    Returns integer or None.
+    """
+    svc = (service_name or "").strip()
+    if not svc:
+        return None
+
+    # Construct natural query
+    qry = f"{svc} typical duration days estimate Nutanix Professional Services"
+    if context:
+        parts = []
+        if context.get("target_platform"):
+            parts.append(str(context["target_platform"]))
+        if context.get("source_platform"):
+            parts.append("from " + str(context["source_platform"]))
+        if context.get("vm_count"):
+            parts.append(f"{int(context['vm_count'])} VMs")
+        if context.get("node_count"):
+            parts.append(f"{int(context['node_count'])} nodes")
+        if parts:
+            qry = f"{svc} {' '.join(parts)} typical duration days estimate"
+
+    log.info("Estimator query: %s", qry)
+
+    # Search for supporting snippets
+    snippets = _serper_search(qry, num=6) if SEARCH_PROVIDER == "serper" else []
+    log.info("Snippets: %d", len(snippets))
+
+    # Prepare evidence text
+    snippet_text = "- " + "\n- ".join(snippets[:8]) if snippets else "No evidence available"
+
+    # Build prompt clearly
+    prompt = f"""You are estimating delivery duration in days for a Nutanix Professional Services engagement.
+
+Service: {svc}
+Context: {json.dumps(context, ensure_ascii=False)}
+
+Evidence snippets:
+{snippet_text}
+
+Rules:
+- Return ONLY an integer number of days. No words. No units.
+- If unclear, output your best conservative integer guess.
+- Example valid answers: 3, 5, 10
+
+Answer:"""
+
+    try:
+        out = call_llm(prompt, max_tokens=20, temperature=0.0)
+        if not out:
+            log.warning(f"LLM returned no output for service: {svc}")
+            return None
+
+        # Extract the first standalone integer from model output
+        m = re.search(r"\b(\d{1,3})\b(?!(\s*(%|percent|year)))", out.lower())
+        if not m:
+            log.warning(f"Could not extract days from LLM output: {out[:120]}")
+            return None
+
+        days = int(m.group(1))
+        log.info(f"AI estimated {days} days for: {svc}")
+        return days
+    except Exception as e:
+        log.error(f"AI duration estimation failed: {e}")
+        return None
+
+
+# -------------------------------------------------------------------------
+#  PUBLIC ENTRYPOINT (used by ranker)
+# -------------------------------------------------------------------------
+def estimate_days_from_web(
+    task_text: str,
+    *,
+    industry: Optional[str] = None,
+    deployment_type: Optional[str] = None,
+    source_platform: Optional[str] = None,
+    target_platform: Optional[str] = None,
+    vm_count: Optional[int] = None,
+    node_count: Optional[int] = None,
+    search_hints: Optional[List[str]] = None,
+) -> Optional[int]:
+    """Wrapper for compatibility with ranker.py."""
+    context = {
+        "industry": industry,
+        "deployment_type": deployment_type,
+        "source_platform": source_platform,
+        "target_platform": target_platform,
+        "vm_count": vm_count,
+        "node_count": node_count,
+    }
+
+    service_name = task_text.strip() if task_text else ""
+    return estimate_days_ai(service_name, context=context)
+
+
+# -------------------------------------------------------------------------
+#  FINAL RULE FOR CHOOSING AI VS DB
+# -------------------------------------------------------------------------
 def pick_days_with_rule(db_days: int, ai_days: Optional[int]) -> int:
     """
-    Rule:
-      - If ai_days < db_days -> keep db_days
-      - Else use ai_days
-      - If ai_days None -> db_days
+    Pick final days conservatively.
+      - If AI days >= db_days, prefer AI.
+      - If AI shorter but within 70%, keep DB.
+      - If AI much shorter, take average.
     """
     if ai_days is None:
-        return db_days
-    if ai_days < db_days:
-        return db_days
-    return ai_days
+        return max(1, db_days)
+
+    if ai_days >= db_days:
+        return max(1, ai_days)
+
+    if ai_days >= (db_days * 0.7):
+        return max(1, db_days)
+
+    avg = int((db_days + ai_days) / 2)
+    return max(1, avg)
