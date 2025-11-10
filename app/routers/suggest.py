@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Tuple
 import logging
 import numpy as np
 from decimal import Decimal
-
+import itertools, math
 from app.models.schemas import SuggestPlanRequest, SuggestPlanResponse
 from app.services.ranker import plan_suggestions
 
@@ -131,6 +131,210 @@ def _phase_order_from_debug(debug: dict) -> List[str]:
     if des.intersection({"dr", "disaster", "recovery", "replication", "protection", "metro", "near"}):
         order.append("dr")
     return order
+
+def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest) -> Dict[str, Any]:
+    """
+    Returns a compact selection object without changing your response schema.
+    The result is placed under debug['selection'] so SuggestPlanResponse stays valid.
+    """
+    constraints = getattr(req, "constraints", None)
+    limit = int(getattr(req, "limit", 8) or 8)
+
+    must_include_names = set()
+    must_exclude_tokens = set()
+    required_families = set()
+    required_targets = set()
+
+    if constraints:
+        must_include_names = set([s.lower() for s in (constraints.must_include or [])])
+        must_exclude_tokens = set([s.lower() for s in (constraints.must_exclude or [])])
+        required_families = set([s.upper() for s in (constraints.product_families or [])])
+        required_targets = set([s.lower() for s in (constraints.target_platforms or [])])
+
+    def norm_name(x: str) -> str:
+        return (x or "").strip().lower()
+
+    def price_float(v) -> float:
+        try:
+            return float(v)
+        except Exception:
+            try:
+                return float(str(v).replace(",", ""))
+            except Exception:
+                return 0.0
+
+    def duration_int(v) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return 0
+
+    # 1) Build candidate pool honoring excludes and filters
+    pool: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    for r in items:
+        name = norm_name(r.get("service_name"))
+        fam = (r.get("product_family") or "").upper()
+        targets = [str(t).lower() for t in (r.get("target_platforms") or [])]
+
+        # Exclude if any must_exclude token hits family or name
+        if must_exclude_tokens:
+            if fam.lower() in must_exclude_tokens or any(tok in name for tok in must_exclude_tokens):
+                continue
+
+        # If product_families specified, require membership
+        if required_families and fam not in required_families:
+            continue
+
+        # If target_platforms specified, require overlap or empty targets allowed
+        if required_targets:
+            if targets and not (required_targets.intersection(targets)):
+                continue
+
+        pool.append(r)
+
+    # 2) Always include must_include items, even if filtered out above, with notes
+    forced: List[Dict[str, Any]] = []
+    for minc in must_include_names:
+        # find highest scored match by name contains or exact
+        matches = [
+            r for r in items
+            if minc in norm_name(r.get("service_name")) or norm_name(r.get("service_name")) == minc
+        ]
+        if matches:
+            # pick max by score
+            pick = max(matches, key=lambda x: float((x.get("score") or 0.0)))
+            # annotate conflict if target mismatch
+            fam = (pick.get("product_family") or "").upper()
+            targets = [str(t).lower() for t in (pick.get("target_platforms") or [])]
+            conflict = False
+            if required_targets and targets and not (required_targets.intersection(targets)):
+                conflict = True
+                warnings.append(
+                    f"Service '{pick.get('service_name')}' was required by must_include but its "
+                    f"target_platforms={targets} do not match constraints.target_platforms={list(required_targets)}. "
+                    f"Included anyway."
+                )
+            if required_families and fam not in required_families:
+                conflict = True
+                warnings.append(
+                    f"Service '{pick.get('service_name')}' was required by must_include but product_family='{fam}' "
+                    f"not in constraints.product_families={list(required_families)}. Included anyway."
+                )
+            forced.append((pick, conflict))
+
+    # 3) Rank remaining pool by your computed score
+    ranked = sorted(pool, key=lambda x: float((x.get("score") or 0.0)), reverse=True)
+
+    # 4) Compose the selection: forced first (dedup), then ranked
+    seen_keys = set()
+    selected: List[Dict[str, Any]] = []
+
+    def add_row(r: Dict[str, Any], note: str | None = None):
+        key = (norm_name(r.get("service_name")), (r.get("product_family") or "").upper())
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        price = price_float(r.get("price_man_day"))
+        dur = duration_int(r.get("estimate", {}).get("chosen_days") or r.get("duration_days") or 0)
+        entry = {
+            "id": r.get("id"),
+            "service_name": r.get("service_name"),
+            "product_family": (r.get("product_family") or "").upper(),
+            "duration_days": dur,
+            "price_man_day": f"{price:.2f}",
+            "cost": round(price * dur, 2),
+        }
+        if note:
+            entry["note"] = note
+        selected.append(entry)
+
+    for pick, conflict in forced:
+        add_row(
+            pick,
+            note="Included due to must_include" + (" (constraint conflict)" if conflict else "")
+        )
+        if len(selected) >= limit:
+            break
+
+    for r in ranked:
+        if len(selected) >= limit:
+            break
+        add_row(r)
+
+    # If nothing selected, return empty with suggestion
+    if not selected:
+        return {
+            "selected_services": [],
+            "total_duration_days": 0,
+            "total_cost": 0,
+            "warnings": warnings or ["No services matched the provided constraints. Check product_families, target_platforms, or must_exclude settings."],
+            "suggestions": [
+                "Relax must_exclude / product_families or add must_include services.",
+                "Try leaving product_families empty to allow any family.",
+            ],
+        }
+    
+    total_days = sum(int(x["duration_days"]) for x in selected)
+    total_cost = round(sum(float(x["cost"]) for x in selected), 2)
+
+    # --- Concise proposal mode trim ---
+    if getattr(req, "proposal_type", None) == "concise":
+        ndp = [
+            r for r in items
+            if (r.get("product_family") or "").upper() == "NDB"
+            and "ahv" in [t.lower() for t in (r.get("target_platforms") or [])]
+        ]
+        ndp.sort(
+            key=lambda x: (
+                float(x.get("score", 0.0)),
+                float(x.get("priority_score", 0.0)),
+                float(x.get("popularity_score", 0.0)),
+            ),
+            reverse=True,
+        )
+        limit = int(getattr(req, "limit", 5) or 5)
+        top5 = ndp[:limit]
+
+        concise_selected = []
+        concise_days = concise_cost = 0
+        for r in top5:
+            dur = int(r.get("duration_days") or 0)
+            price = float(r.get("price_man_day") or 0)
+            cost = round(dur * price, 2)
+            concise_selected.append({
+                "id": r.get("id"),
+                "service_name": r.get("service_name"),
+                "duration_days": dur,
+                "price_man_day": f"{price:.2f}",
+                "cost": cost,
+            })
+            concise_days += dur
+            concise_cost += cost
+
+        return {
+            "selected_services": concise_selected,
+            "total_duration_days": concise_days,
+            "total_cost": concise_cost,
+            "notes": [
+                "Selected top 5 NDB services targeting AHV based on scoring (priority/popularity).",
+                "If you want per-DB scaling (3 DBs), enable DB-scaling logic; current cost model is per-service.",
+            ],
+        }
+
+    # --- Default full mode ---
+    return {
+        "selected_services": selected,
+        "total_duration_days": total_days,
+        "total_cost": total_cost,
+        "warnings": warnings,
+        "notes": [
+            "Selection ranked by model score. Forced inclusions appear first.",
+            "Costs use duration_days * price_man_day as provided by ranking output.",
+        ],
+    }
+
 
 # ------------------ route ------------------
 
@@ -300,12 +504,22 @@ def suggest_plan(req: SuggestPlanRequest):
         },
     }
 
+    # ---- optimal selection (smart combinatorial pick) ----
+    selection = {}
+    try:
+        selection = select_optimal_services(items_serialized, req)
+    except Exception as e:
+        log.exception("select_optimal_services failed: %s", e)
+        selection = {"error": f"selection_failed: {str(e)}"}
+
+
     resp_payload = {
         "items": items_serialized,
         "count": len(items_serialized),
         "journey": journey,
-        "debug": _to_python_native(debug or {})
+        "debug": {**_to_python_native(debug or {}), "selection": selection},
     }
+
 
     try:
         return SuggestPlanResponse(**resp_payload)
