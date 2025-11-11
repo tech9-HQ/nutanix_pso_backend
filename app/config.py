@@ -26,3 +26,20 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+# -----------------------------
+# Static boilerplate used by /generate_proposal
+# -----------------------------
+TERMS_AND_CONDITIONS = [
+    "Engagement scope is limited to the services and deliverables defined in this Statement of Work.",
+    "All activities are performed remotely unless explicitly stated otherwise in the scope.",
+    "Customer will provide timely access to systems, environments, data, and stakeholders as needed.",
+    "Any change in scope, assumptions, or prerequisites requires a mutually approved change request.",
+    "Dependencies on third-party products, licenses, or infrastructure are the customer’s responsibility.",
+    "Project schedules are subject to customer resource availability and environment readiness.",
+    "Travel, lodging, and other out-of-pocket expenses are billable at actuals, if applicable.",
+    "All fees exclude applicable taxes and duties; taxes will be charged as per prevailing law.",
+    "Deliverables are provided on a best-effort basis aligned to stated acceptance criteria.",
+    "Post-implementation support outside the defined scope will be treated as a new engagement.",
+]

@@ -1,13 +1,27 @@
 # app/services/proposals_repo.py
 from __future__ import annotations
-from typing import List, Dict, Any, Optional
-from supabase import create_client, Client
-from app.config import get_settings
-from urllib.parse import quote_plus
-import re
 
+from typing import List, Dict, Any, Optional
+import os
+import re
+import logging
+
+import httpx  # needed for fetch_candidates_smart
+from supabase import create_client, Client
+from urllib.parse import quote_plus
+
+from app.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# Supabase client
+# -----------------------------------------------------------------------------
 _s = get_settings()
 _supabase: Client = create_client(_s.supabase_url, _s.supabase_anon_key)
+
+# Export a read-only handle for other modules
+supabase_ro: Client = _supabase
 
 _FIELDS = (
     "id,category_name,service_name,positioning,duration_days,price_man_day,"
@@ -15,6 +29,49 @@ _FIELDS = (
     "priority_score,popularity_score,product_family"
 )
 
+# -----------------------------------------------------------------------------
+# Optional PDF chunk infra (used by generate_proposal pipeline)
+# -----------------------------------------------------------------------------
+# If you store this in settings, prefer that. Otherwise use env fallback.
+REFERENCE_PDF_PATH: str = getattr(_s, "reference_pdf_path", None) or os.getenv("REFERENCE_PDF_PATH", "")
+
+try:
+    import fitz  # PyMuPDF
+except Exception:  # pragma: no cover
+    fitz = None  # type: ignore
+
+PDF_CHUNKS: List[Dict[str, Any]] = []  # [{'page': int, 'text': str}, ...]
+
+def load_pdf_chunks(path: str) -> List[Dict[str, Any]]:
+    """
+    Minimal chunk loader. Returns [{'page': int, 'text': str}] list.
+    If PyMuPDF is not available or file missing, returns empty list.
+    """
+    global PDF_CHUNKS
+    if not (path and os.path.exists(path) and fitz):
+        logger.warning("PDF chunk load skipped (missing file or PyMuPDF). path=%r", path)
+        PDF_CHUNKS = []
+        return PDF_CHUNKS
+    try:
+        doc = fitz.open(path)
+        chunks: List[Dict[str, Any]] = []
+        for i in range(len(doc)):
+            page = doc.load_page(i)
+            text = page.get_text("text") or ""
+            text = text.strip()
+            if text:
+                chunks.append({"page": i + 1, "text": text})
+        PDF_CHUNKS = chunks
+        logger.info("Loaded %d PDF chunks from %s", len(PDF_CHUNKS), path)
+        return PDF_CHUNKS
+    except Exception:
+        logger.exception("Failed to load PDF chunks from %s", path)
+        PDF_CHUNKS = []
+        return PDF_CHUNKS
+
+# -----------------------------------------------------------------------------
+# Search helpers
+# -----------------------------------------------------------------------------
 # Broad synonym packs used by the ranker labels
 TERM_PACKS: Dict[str, List[str]] = {
     "fitcheck": [
@@ -57,60 +114,6 @@ def _safe_tokens(text: str, max_tokens: int = 12) -> List[str]:
             break
     return out
 
-# add near top
-from urllib.parse import quote_plus
-
-# add this function anywhere in module
-def build_or_ilike(keys: list[str], columns: list[str]) -> str:
-    parts = []
-    for k in keys:
-        if not k: 
-            continue
-        like = f"%{quote_plus(k)}%"
-        for col in columns:
-            if col.endswith(".ov"):
-                parts.append(f"{col}.%7B{quote_plus(k)}%7D")
-            else:
-                parts.append(f"{col}.ilike.{like}")
-    return f"({','.join(parts)})" if parts else ""
-
-def fetch_candidates_smart(
-    sb_url: str,
-    sb_key: str,
-    table: str,
-    product_family: str,
-    platform_bucket: str,      # 'azure' | 'aws' | 'ahv' | 'null' | 'other'
-    or_filter: str,
-    limit: int = 100,
-):
-    sel = ",".join([
-        "id","category_name","service_name","positioning","duration_days","price_man_day",
-        "canonical_names","service_type","supports_db_migration","target_platforms",
-        "priority_score","popularity_score","product_family","embedding"
-    ])
-    params = {
-        "select": sel,
-        "product_family": f"eq.{product_family}",
-        "order": "priority_score.desc.nullslast,popularity_score.desc.nullslast,duration_days.asc.nullsfirst",
-        "limit": str(limit)
-    }
-    if platform_bucket == "null":
-        params["target_platforms"] = "is.null"
-    elif platform_bucket == "other":
-        params["target_platforms"] = "not.ov.%7Bahv,aws,azure%7D"
-    else:
-        params["target_platforms"] = f"ov.%7B{platform_bucket}%7D"
-    if or_filter:
-        params["or"] = or_filter
-
-    url = f"{sb_url.rstrip('/')}/rest/v1/{table}"
-    headers = {"apikey": sb_key, "Authorization": f"Bearer {sb_key}"}
-    with httpx.Client(timeout=httpx.Timeout(10.0, read=20.0)) as cx:
-        r = cx.get(url, headers=headers, params=params)
-        r.raise_for_status()
-        return r.json()
-
-
 def _expand_query_terms(q: Optional[str]) -> List[str]:
     if not q:
         return []
@@ -130,7 +133,8 @@ def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
     r["popularity_score"] = float(r.get("popularity_score") or 0)
     return r
 
-def _apply_exact_filters(qb, *,
+def _apply_exact_filters(qb,
+                         *,
                          product_family: Optional[str],
                          service_type: Optional[str],
                          supports_db_migration: Optional[bool],
@@ -157,7 +161,7 @@ def _apply_text_search_multi(qb, terms: List[str]):
         return qb
     ors: List[str] = []
     for t in terms:
-        t_esc = t.replace(",", " ")  # guard commas
+        t_esc = t.replace(",", " ")
         ors.append(f"service_name.ilike.%{t_esc}%")
         ors.append(f"positioning.ilike.%{t_esc}%")
         ors.append(f"product_family.ilike.%{t_esc}%")
@@ -190,13 +194,23 @@ def _dedupe_keep_best(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not prev:
             best[rid] = r
             continue
-        # keep higher priority/popularity and shorter duration
-        cur_key = (r.get("priority_score", 0.0), r.get("popularity_score", 0.0), -(r.get("duration_days") or 1e9))
-        prev_key = (prev.get("priority_score", 0.0), prev.get("popularity_score", 0.0), -(prev.get("duration_days") or 1e9))
+        cur_key = (
+            r.get("priority_score", 0.0),
+            r.get("popularity_score", 0.0),
+            -(r.get("duration_days") or 1e9)
+        )
+        prev_key = (
+            prev.get("priority_score", 0.0),
+            prev.get("popularity_score", 0.0),
+            -(prev.get("duration_days") or 1e9)
+        )
         if cur_key > prev_key:
             best[rid] = r
     return list(best.values())
 
+# -----------------------------------------------------------------------------
+# Public repo API
+# -----------------------------------------------------------------------------
 def get_all_proposals() -> List[Dict[str, Any]]:
     resp = _supabase.table("proposals_updated").select(_FIELDS).execute()
     rows: List[Dict[str, Any]] = getattr(resp, "data", []) or []
@@ -289,3 +303,78 @@ def suggest_services_repo(
     rows = [_normalize_row(r) for r in _dedupe_keep_best(rows)]
     rows = _py_sort(rows)[:limit]
     return rows
+
+# -----------------------------------------------------------------------------
+# Direct REST fetch (if you need to bypass supabase-py for special filters)
+# -----------------------------------------------------------------------------
+def build_or_ilike(keys: List[str], columns: List[str]) -> str:
+    """
+    Build a URL-encoded Supabase 'or' filter that applies ilike or ov to columns.
+    For array columns use suffix '.ov' in the column name passed in `columns`.
+    Example:
+      build_or_ilike(["fitcheck","workshop"], ["service_name", "positioning", "canonical_names.ov"])
+    """
+    parts: List[str] = []
+    for k in keys:
+        if not k:
+            continue
+        like = f"%{quote_plus(k)}%"
+        for col in columns:
+            if col.endswith(".ov"):
+                # array overlap: canonical_names.ov.{term}
+                parts.append(f"{col}.%7B{quote_plus(k)}%7D")
+            else:
+                # text ilike: service_name.ilike.%term%
+                parts.append(f"{col}.ilike.{like}")
+    return f"({','.join(parts)})" if parts else ""
+
+def fetch_candidates_smart(
+    sb_url: str,
+    sb_key: str,
+    table: str,
+    product_family: str,
+    platform_bucket: str,      # 'azure' | 'aws' | 'ahv' | 'null' | 'other'
+    or_filter: str,
+    limit: int = 100,
+):
+    sel = ",".join([
+        "id","category_name","service_name","positioning","duration_days","price_man_day",
+        "canonical_names","service_type","supports_db_migration","target_platforms",
+        "priority_score","popularity_score","product_family","embedding"
+    ])
+    params = {
+        "select": sel,
+        "product_family": f"eq.{product_family}",
+        "order": "priority_score.desc.nullslast,popularity_score.desc.nullslast,duration_days.asc.nullsfirst",
+        "limit": str(limit)
+    }
+    if platform_bucket == "null":
+        params["target_platforms"] = "is.null"
+    elif platform_bucket == "other":
+        params["target_platforms"] = "not.ov.%7Bahv,aws,azure%7D"
+    else:
+        params["target_platforms"] = f"ov.%7B{platform_bucket}%7D"
+    if or_filter:
+        params["or"] = or_filter
+
+    url = f"{sb_url.rstrip('/')}/rest/v1/{table}"
+    headers = {"apikey": sb_key, "Authorization": f"Bearer {sb_key}"}
+    with httpx.Client(timeout=httpx.Timeout(10.0, read=20.0)) as cx:
+        r = cx.get(url, headers=headers, params=params)
+        r.raise_for_status()
+        return r.json()
+
+# -----------------------------------------------------------------------------
+# Explicit exports
+# -----------------------------------------------------------------------------
+__all__ = [
+    "supabase_ro",
+    "REFERENCE_PDF_PATH",
+    "PDF_CHUNKS",
+    "fitz",
+    "load_pdf_chunks",
+    "get_all_proposals",
+    "suggest_services_repo",
+    "build_or_ilike",
+    "fetch_candidates_smart",
+]

@@ -1,6 +1,12 @@
+# app/services/journey.py
 from __future__ import annotations
 from typing import List, Dict, Any
+import re
+from app.services.proposals_repo import PDF_CHUNKS
 
+# -------------------------------------------------------------------
+# Phase mapping logic (your existing code)
+# -------------------------------------------------------------------
 _PHASE_ORDER = {
     "Kickoff / Assessment & Planning": 1,
     "Infrastructure Setup": 2,
@@ -11,12 +17,12 @@ _PHASE_ORDER = {
 
 def make_journey(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Build phase view using the already-overwritten duration_days from ranker."""
-    def _phase_of(r: Dict[str,Any]) -> str:
-        reason = r.get("reason","")
+    def _phase_of(r: Dict[str, Any]) -> str:
+        reason = r.get("reason", "")
         if reason.startswith("[") and "]" in reason:
             return reason[1:reason.index("]")]
         cat = (r.get("category_name") or "").lower()
-        if "assessment" in cat or "fitcheck" in (r.get("service_name","").lower()):
+        if "assessment" in cat or "fitcheck" in (r.get("service_name", "").lower()):
             return "Kickoff / Assessment & Planning"
         if "deployment" in cat:
             return "Infrastructure Setup"
@@ -27,19 +33,23 @@ def make_journey(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     phases: Dict[str, Dict[str, Any]] = {}
     for it in items:
         ph = _phase_of(it)
-        bucket = phases.setdefault(ph, {"phase": ph, "services": [], "phase_days": 0, "phase_cost_usd": 0.0})
+        bucket = phases.setdefault(
+            ph, {"phase": ph, "services": [], "phase_days": 0, "phase_cost_usd": 0.0}
+        )
         days = int(it.get("duration_days") or 0)
         rate = float(it.get("price_man_day") or 0.0)
-        bucket["services"].append({
-            "id": it["id"],
-            "name": it["service_name"],
-            "family": it["product_family"],
-            "type": it.get("service_type"),
-            "days": days,
-            "rate_usd_per_day": rate,
-            "extended_usd": rate * days,
-            "why": it.get("reason",""),
-        })
+        bucket["services"].append(
+            {
+                "id": it["id"],
+                "name": it["service_name"],
+                "family": it["product_family"],
+                "type": it.get("service_type"),
+                "days": days,
+                "rate_usd_per_day": rate,
+                "extended_usd": rate * days,
+                "why": it.get("reason", ""),
+            }
+        )
         bucket["phase_days"] += days
         bucket["phase_cost_usd"] += rate * days
 
@@ -49,5 +59,35 @@ def make_journey(items: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {
         "phases": ordered,
-        "totals": {"days": total_days, "cost_usd": total_cost}
+        "totals": {"days": total_days, "cost_usd": total_cost},
     }
+
+# -------------------------------------------------------------------
+# Lightweight PDF chunk mapper used by generate_proposal
+# -------------------------------------------------------------------
+def map_kb_and_pdf_chunks_for_service(service_name: str, top_k: int = 8) -> List[Dict[str, Any]]:
+    """
+    Rank PDF_CHUNKS text snippets relevant to the given service_name.
+    Returns a list of dicts: {'page': int, 'text': str, 'score': float}
+    """
+    if not PDF_CHUNKS or not service_name:
+        return []
+    query = service_name.lower()
+    query_tokens = re.findall(r"[a-z0-9]+", query)
+    ranked: List[Dict[str, Any]] = []
+    for ch in PDF_CHUNKS:
+        txt = (ch.get("text") or "").lower()
+        if not txt:
+            continue
+        score = sum(txt.count(tok) for tok in query_tokens)
+        if score > 0:
+            ranked.append(
+                {"page": ch.get("page"), "text": ch.get("text"), "score": score}
+            )
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+    return ranked[: max(1, int(top_k or 1))]
+
+# -------------------------------------------------------------------
+# Explicit exports
+# -------------------------------------------------------------------
+__all__ = ["make_journey", "map_kb_and_pdf_chunks_for_service"]

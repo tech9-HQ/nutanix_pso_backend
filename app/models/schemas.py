@@ -1,6 +1,8 @@
 # app/models/schemas.py
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
+
+# ---------- Suggest / Service models ----------
 
 class SuggestRequest(BaseModel):
     product_family: Optional[str] = None
@@ -33,6 +35,8 @@ class BOQItem(BaseModel):
     vendor: Optional[str] = None
     notes: Optional[str] = None
 
+# ---------- Constraints & Plan ----------
+
 class Constraints(BaseModel):
     target_platforms: List[str] = Field(default_factory=list)
     product_families: List[str] = Field(default_factory=list)
@@ -50,7 +54,6 @@ class SuggestPlanRequest(BaseModel):
     proposal_type: Optional[str] = None         # "short" | "detailed"
     deployment_type: Optional[str] = None       # "on prem" | "hybrid" | "cloud" | "dark site"
     providers: List[str] = Field(default_factory=list)
-
     constraints: Constraints = Field(default_factory=Constraints)
     limit: int = 8
 
@@ -91,5 +94,21 @@ class JourneyModel(BaseModel):
 class SuggestPlanResponse(BaseModel):
     count: int
     items: List[RankedService]
-    journey: Optional[JourneyModel] = None   # added
+    journey: Optional[JourneyModel] = None
     debug: Optional[Dict[str, Any]] = None
+
+# ---------- Proposal generation (used by generate_proposal endpoint) ----------
+class ProposalRequest(BaseModel):
+    # Accepts company_name (current UI) and client_name (alt)  
+    company_name: str = Field(..., alias="client_name")
+    # Accepts client_requirements and requirements_text
+    client_requirements: str = Field(..., alias="requirements_text")
+
+    industry: Optional[str] = None
+    deployment_type: Optional[str] = None
+    proposal_type: Optional[str] = None  # "short" | "detailed"
+    services: List[Dict[str, Any]] = Field(default_factory=list)
+    runtime_pdf: bool = False
+
+    # allow population by field name or alias
+    model_config = ConfigDict(populate_by_name=True)

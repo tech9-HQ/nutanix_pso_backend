@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from app.middleware import install_middlewares
 from app.logging_config import setup_logging
 from app.routers import health, suggest 
+from app.routers.generate_proposal import router as generate_proposal_router
 setup_logging()
 
 app = FastAPI(title="nutanix_pso_generator")
@@ -13,6 +14,7 @@ install_middlewares(app)
 
 app.include_router(health.router)
 app.include_router(suggest.router)
+app.include_router(generate_proposal_router)
 
 @app.get("/")
 def root():
