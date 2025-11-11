@@ -1,13 +1,13 @@
 # app/routers/suggest.py
 from __future__ import annotations
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Form
 from typing import Any, Dict, List, Tuple
 import logging
 import numpy as np
 from decimal import Decimal
 import itertools, math
 from app.models.schemas import SuggestPlanRequest, SuggestPlanResponse
-from app.services.ranker import plan_suggestions
+from app.services.ranker import plan_suggestions 
 
 router = APIRouter(prefix="/suggest", tags=["suggest"])
 log = logging.getLogger("suggest")
@@ -526,3 +526,56 @@ def suggest_plan(req: SuggestPlanRequest):
     except Exception as e:
         log.exception("Failed to validate SuggestPlanResponse: %s", e)
         raise HTTPException(status_code=500, detail=f"Response validation error: {e}")
+
+
+@router.post("", response_model=SuggestPlanResponse)
+def suggest_plan_form(
+    client_name: str = Form("Client"),
+    industry: str | None = Form(None),
+    requirements_text: str = Form(...),
+    top_k: int = Form(6),
+    # optional FE extras:
+    hardware_providers: str | None = Form(None),  # e.g. "NUTANIX, DELL"
+    boq_text: str | None = Form(None),
+    limit: int = Form(8),
+    proposal_type: str | None = Form(None),       # e.g. "concise"
+):
+    """
+    Accepts FormData from the frontend and forwards it to the JSON /suggest/plan
+    by constructing a SuggestPlanRequest payload.
+    """
+    # Parse vendors string into tokens for constraints.must_exclude (example policy).
+    # Adjust to your needs (e.g., must_include or product_families) if desired.
+    vendor_tokens = []
+    if hardware_providers:
+        vendor_tokens = [v.strip().lower() for v in hardware_providers.split(",") if v.strip()]
+
+    payload = {
+        "client_name": client_name,
+        "industry": industry,
+        "requirements_text": requirements_text,
+        "top_k": top_k,
+        "limit": limit,
+        "proposal_type": proposal_type,
+        # You can pass any extra context your planner uses:
+        "context": {
+            "hardware_providers": vendor_tokens,
+            "boq_text": boq_text or "",
+        },
+        # Basic constraints example: exclude services containing vendor tokens
+        "constraints": {
+            "must_exclude": vendor_tokens,
+            # leave others empty so your selector stays permissive by default
+            "must_include": [],
+            "product_families": [],
+            "target_platforms": [],
+        },
+    }
+
+    try:
+        req_obj = SuggestPlanRequest(**payload)
+    except Exception as e:
+        # If your Pydantic schema names differ, inspect and adapt the keys above.
+        raise HTTPException(status_code=422, detail=f"Invalid suggest payload: {e}")
+
+    return suggest_plan(req_obj)
