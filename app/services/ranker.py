@@ -1,4 +1,4 @@
-# app/services/ranker.py — Intelligent planner (phase-covered, strict top_k, journey-fixed)
+# app/services/ranker.py — Intelligent planner (one suggestion, tier-gated, phase-aware)
 from __future__ import annotations
 from typing import List, Tuple, Dict, Any, Optional, Set
 import json, re, logging, os
@@ -8,6 +8,7 @@ import httpx
 from app.models.schemas import SuggestPlanRequest
 from app.services.proposals_repo import suggest_services_repo
 from app.services.duration_estimator import estimate_days_from_web, pick_days_with_rule, call_llm
+from app.services.company_size import get_company_size
 
 log = logging.getLogger("ranker")
 
@@ -81,6 +82,62 @@ def _to_py(val: Any):
     if isinstance(val, dict):
         return {str(k): _to_py(v) for k, v in val.items()}
     return val
+
+# ------------------ tier helpers ------------------
+
+_TIER_KEYWORDS = {
+    "starter":  ["starter","basic","essentials","essential","foundation","foundational"],
+    "pro":      ["pro","standard","advanced","plus"],
+    "ultimate": ["ultimate","enterprise","premium","platinum","ultra"],
+}
+_TIER_WORDS = {w for arr in _TIER_KEYWORDS.values() for w in arr}
+
+def _infer_row_tier(row: Dict[str, Any]) -> Optional[str]:
+    text = " ".join([
+        str(row.get("service_name","")),
+        str(row.get("positioning","")),
+        " ".join(row.get("canonical_names") or []),
+        str(row.get("category_name","")),
+    ]).lower()
+    for tier, words in _TIER_KEYWORDS.items():
+        if any(w in text for w in words):
+            return tier
+    return None
+
+def _tierless_key(row: Dict[str, Any]) -> str:
+    name = (row.get("service_name") or "").lower()
+    name = re.sub(
+        r"\s*-\s*(starter|pro|ultimate|enterprise|premium|platinum|basic|essentials|standard|advanced|plus)\b",
+        "",
+        name,
+    )
+    name = re.sub(r"\b(" + "|".join(map(re.escape, _TIER_WORDS)) + r")\b", "", name)
+    name = re.sub(r"\s{2,}", " ", name).strip()
+    fam  = (row.get("product_family") or "").lower()
+    cat  = (row.get("category_name") or "").lower()
+    return f"{cat}|{fam}|{name}"
+
+def _parse_int_maybe(v) -> Optional[int]:
+    try:
+        return int(str(v).replace(",", "").strip())
+    except Exception:
+        return None
+
+def _desired_tier_for_size(n: Optional[int]) -> Optional[str]:
+    if n is None: return None
+    if n < 500:   return "starter"
+    if n < 1000:  return "pro"
+    return "ultimate"
+
+def _extract_company_size_from_req(req) -> Optional[int]:
+    for obj in (req, getattr(req, "constraints", None), getattr(req, "meta", None)):
+        if not obj: continue
+        for attr in ("company_size","employee_count","employees","org_size","size"):
+            n = _parse_int_maybe(getattr(obj, attr, None))
+            if n is not None:
+                return n
+    client = getattr(req, "client_name", None) or getattr(req, "company_name", None)
+    return get_company_size(client)
 
 # ------------------ keyword expansion ------------------
 
@@ -315,57 +372,47 @@ def _honor_constraints(row: Dict[str, Any], req: SuggestPlanRequest, scope: Dict
     """
     Dynamic constraint gate with no hardcoded service names.
     - Respect req.constraints.target_platforms
-    - Respect must_exclude: ["AHV-only services"] to drop AHV-only rows if target is Azure/AWS
+    - Respect must_exclude: ["AHV-only services"]
     - Respect allowed product_families if provided
-    - Soft-exclude EUC/OTHER families unless text implies EUC/AI
+    - Soft-exclude EUC/OTHER unless text implies EUC/AI
     """
     txt = f"{req.requirements_text or ''} {' '.join([b.description or '' for b in (req.boq or [])])}".lower()
 
-    # families
     allowed_fams = set((getattr(req, "constraints", None) and (req.constraints.product_families or [])) or (ai_scope.get("product_families") or []))
     fam = (row.get("product_family") or "").upper()
     if allowed_fams and fam and fam not in allowed_fams:
         return False
 
-    # platforms
     wanted_platforms = set((getattr(req, "constraints", None) and (req.constraints.target_platforms or [])) or [])
     targets = set([t.lower() for t in (row.get("target_platforms") or []) if t])
-
     if wanted_platforms:
-        # if row declares targets, require intersection; if row is null targets, allow
         if targets and not targets.intersection(wanted_platforms):
             return False
 
-    # AHV-only exclusion
     must_ex = set((getattr(req, "constraints", None) and (req.constraints.must_exclude or [])) or (ai_scope.get("hard_constraints", {}).get("must_exclude") or []))
     if "AHV-only services" in must_ex:
         if targets == {"ahv"} or ("ahv" in targets and not targets.intersection({"azure","aws","gcp"})):
             return False
 
-    # Soft exclusion of EUC/OTHER unless requested
     if (fam == "OTHER" or "euc" in (row.get("service_name","").lower())) and not any(k in txt for k in ["euc","end user","gold image","app layering","broker","naigpt","ai "]):
         return False
 
     return True
 
-# --- replace _dynamic_service_fetch with this version ---
 def _dynamic_service_fetch(req: SuggestPlanRequest, scope: Dict[str, Any], ai_scope: Dict[str, Any]) -> List[Dict[str, Any]]:
     fam_from_req = list(getattr(req, "constraints", None) and (req.constraints.product_families or []) or [])
     fam_from_ai  = list(ai_scope.get("product_families") or [])
     families = fam_from_req or fam_from_ai or ["NCI","NC2","NDB","NKP","NUS"]
 
-    # if databases are mentioned, force-include NDB; if NC2 present, also include NCI for DR/networking
     if scope.get("has_database") and "NDB" not in families:
         families.append("NDB")
     if "NC2" in families and "NCI" not in families:
         families.append("NCI")
 
-    # user/AI requested platforms
     req_platforms = list(getattr(req, "constraints", None) and (req.constraints.target_platforms or []) or [])
     ai_platform   = [ai_scope.get("target_platform")] if ai_scope.get("target_platform") else []
-    platforms     = req_platforms or ai_platform  # may be []
+    platforms     = req_platforms or ai_platform
 
-    # broaden query surface so every phase has candidates
     queries = [None, "fitcheck", "assessment", "infrastructure", "deployment",
                "migration", "move", "database", "dr", "recovery", "protection", "metro"]
 
@@ -373,14 +420,12 @@ def _dynamic_service_fetch(req: SuggestPlanRequest, scope: Dict[str, Any], ai_sc
     out: List[Dict[str, Any]] = []
 
     for fam in families:
-        # Keep platform filter only for NC2. For NCI/NDB/NUS/NKP fetch all and let scoring decide.
         fam_platforms = platforms if fam in ("NC2",) and platforms else None
-
         for q in queries:
             try:
                 rows = suggest_services_repo(
                     product_family=fam,
-                    platforms=fam_platforms,   # <- relaxed
+                    platforms=fam_platforms,
                     limit=80,
                     service_type=None,
                     q=q,
@@ -393,7 +438,6 @@ def _dynamic_service_fetch(req: SuggestPlanRequest, scope: Dict[str, Any], ai_sc
                     seen.add(rid)
                     out.append(r)
     return out
-
 
 # ------------------ scoring ------------------
 
@@ -447,8 +491,17 @@ def _calc_relevance(
         score += 0.10; reasons.append("Phase: assessment")
     if needs.get("needs_deployment") and (stype == "deployment" or "infrastructure" in name or "deployment" in name or "cluster" in name):
         score += 0.15; reasons.append("Phase: deployment")
-    if needs.get("needs_migration") and (stype == "migration") and not any(k in category for k in ["database"]) and "db" not in name and family != "NDB":
-        score += 0.15; reasons.append("Phase: migration")
+    if needs.get("needs_migration") and (stype == "migration"):
+        src = (scope.get("source_platform") or "").lower()
+        tgt = (scope.get("target_platform") or "").lower()
+        name_lower = name.lower()
+        if src in name_lower or tgt in name_lower or "cisco" in name_lower or "ahv" in name_lower:
+            score += 0.35; reasons.append(f"Migration {src or ''}->{tgt or ''}".strip("-"))
+            if scope.get("vm_count", 0) > 0:
+                score += 0.10; reasons.append(f"VMs={scope['vm_count']}")
+        else:
+            score -= 0.20  # penalize irrelevant migrations
+
     if needs.get("needs_dr") and any(k in name for k in [" dr", "disaster", "recovery", "protection", "near", "metro", "replication", "leap", "sync"]):
         score += 0.10; reasons.append("Phase: DR")
 
@@ -497,11 +550,9 @@ def _calc_relevance(
         else:
             score -= 0.05
 
-    # Down-weight EUC/OTHER when not asked
     if family in {"OTHER"} and not any(k in query_text.lower() for k in ["euc","naigpt","ai "]):
         score -= 0.35
 
-    # Keyword overlap
     qtok = set(_tokenize(query_text))
     stok = set(_tokenize(f"{name} {category} {family}"))
     ov = len(qtok & stok)
@@ -524,36 +575,23 @@ def _infer_phase(service: Dict[str, Any]) -> str:
     cat   = (service.get("category_name") or "").lower()
     stype = (service.get("service_type") or "").lower()
 
-    # 1) Assessment first so "Database FitCheck" stays assessment
     if "assessment" in stype or "assessment" in cat or any(k in name for k in ["fitcheck", "readiness"]):
         return "assessment"
-
-    # 2) Migration next. Catch bundles labeled design but actually migration.
     if "migration" in name or "move" in name or "transition" in name or "migration" in cat:
         return "migration"
-
-    # 3) DR
     if any(k in name for k in [" dr", "disaster", "recovery", "protection", "metro", "nearsync", "replication", "leap"]) \
        or any(k in cat for k in ["dr","disaster","recovery","protection","metro","replication"]):
         return "dr"
-
-    # 4) Database-only services that aren’t assessments
     if any(k in name for k in ["database", " ndb", " db "]) or "database" in cat:
         return "database"
-
-    # 5) Default deployment
     if "deployment" in stype or "deployment" in name or "infrastructure" in name or "implementation" in name:
         return "deployment"
-
     return "deployment"
-
-
 
 def _build_journey(items_serialized: list, daily_rate_field: str = "price_man_day") -> Dict[str, Any]:
     phases_order = ["assessment", "deployment", "migration", "database", "dr"]
     bucket = {p: [] for p in phases_order}
 
-    # Dedup by id across all phases
     seen_ids = set()
     for it in items_serialized:
         sid = it.get("id")
@@ -585,7 +623,6 @@ def _build_journey(items_serialized: list, daily_rate_field: str = "price_man_da
     return {"phases": out_phases, "totals": {"days": int(totals_days), "cost_usd": float(totals_cost)}}
 
 def _phase_backfill(phase: str) -> List[Dict[str, Any]]:
-    """Fetch fallback services per phase with broad query and relaxed family filtering."""
     fam_map = {
         "assessment": ["NCI", "NC2", "NDB"],
         "deployment": ["NC2", "NCI"],
@@ -610,7 +647,6 @@ def _phase_backfill(phase: str) -> List[Dict[str, Any]]:
                 continue
     return out
 
-
 def _ensure_phase_coverage(
     ranked: List[Dict[str, Any]],
     base_items: List[Dict[str, Any]],
@@ -618,49 +654,43 @@ def _ensure_phase_coverage(
     required_phases_list: List[str],
     top_k: int
 ) -> List[Dict[str, Any]]:
-    """Ensure every required project phase has at least one matching service."""
-    required = required_phases_list or []
-    covered = { _infer_phase(it) for it in base_items }
-    missing = [p for p in required if p not in covered]
-    if not missing:
-        return base_items[:top_k]
+    """
+    Ensure exactly one top-ranked service per required phase.
+    """
+    required = required_phases_list or ["assessment", "deployment", "migration", "database", "dr"]
 
-    phase_index = {p: [] for p in ["assessment","deployment","migration","database","dr"]}
+    # Build phase-wise index from ranked list
+    phase_index = {p: [] for p in required}
     for r in ranked:
-        phase_index[_infer_phase(r)].append(r)
+        ph = _infer_phase(r)
+        if ph in phase_index:
+            phase_index[ph].append(r)
 
-    seen_keys = {( (it.get("service_name") or "").strip().lower(),
-                   (it.get("product_family") or "").strip().lower()) for it in base_items}
-    out = list(base_items)
-
-    # try direct fill
-    for ph in missing:
+    # Pick top one per phase
+    out = []
+    seen = set()
+    for ph in required:
         for cand in phase_index.get(ph, []):
-            key = (str(cand.get("service_name") or "").strip().lower(),
-                   str(cand.get("product_family") or "").strip().lower())
-            if key in seen_keys:
+            key = (
+                (cand.get("service_name") or "").strip().lower(),
+                (cand.get("product_family") or "").strip().lower(),
+            )
+            if key in seen:
                 continue
             out.append(cand)
-            seen_keys.add(key)
-            break
+            seen.add(key)
+            break  # only 1 per phase
 
-    # backfill
-    still_missing = [p for p in required if p not in { _infer_phase(it) for it in out }]
-    for ph in still_missing:
-        for cand in _phase_backfill(ph):
-            key = (str(cand.get("service_name") or "").strip().lower(),
-                   str(cand.get("product_family") or "").strip().lower())
-            if key not in seen_keys:
-                out.append(cand)
-                seen_keys.add(key)
-                break
+    # Safety: fallback if no required_phases detected
+    if not out and ranked:
+        out.append(ranked[0])
 
-    # re-score backfilled items
+    # Score recalculation if missing
     for it in out:
         sc = (it.get("_scores") or {}).get("final")
         if not sc or sc == 0.0:
             prio = float(it.get("priority_score") or 0.0)
-            pop  = float(it.get("popularity_score") or 0.0)
+            pop = float(it.get("popularity_score") or 0.0)
             kw_bonus = 0.5 if any(k in (it.get("service_name","").lower())
                                    for k in ["fitcheck","migration","dr","database","deployment"]) else 0.0
             it["_scores"] = {
@@ -670,20 +700,8 @@ def _ensure_phase_coverage(
                 "popularity": pop,
             }
 
-    # trim
-    if len(out) > top_k:
-        must_keep = set()
-        for ph in required:
-            for i, it in enumerate(out):
-                if _infer_phase(it) == ph:
-                    must_keep.add(i)
-                    break
-        keep_items = [it for i, it in enumerate(out) if i in must_keep]
-        extra = [it for i, it in enumerate(out) if i not in must_keep]
-        extra.sort(key=lambda x: float(((x.get("_scores") or {}).get("final")) or 0.0), reverse=True)
-        out = (keep_items + extra)[:top_k]
-
     return out
+
 
 # ------------------ duration helpers ------------------
 
@@ -717,7 +735,6 @@ def _estimate_and_pick_days_for_service(svc, scope, industry, deployment_type) -
     except Exception:
         ai_days = None
 
-    # NEW: clamp to prevent runaway inflation/deflation
     if ai_days is not None:
         ai_days = int(max(db_days, min(ai_days, max(1, int(db_days * 2.5)))))
 
@@ -725,12 +742,12 @@ def _estimate_and_pick_days_for_service(svc, scope, industry, deployment_type) -
     provider = "ai" if (ai_days is not None and ai_days >= db_days) else "db"
     return {"db_days": db_days, "ai_days": ai_days, "chosen_days": chosen, "provider": provider}
 
-
 # ------------------ main planner ------------------
 
 def plan_suggestions(req: "SuggestPlanRequest"):
     """
     Returns: (items_serialized: List[Dict], debug: Dict, journey: Dict)
+    One best-fit service per detected phase (assessment, deployment, migration, database, dr).
     """
     # ---------- Intent text ----------
     intent_text = " ".join([
@@ -847,14 +864,8 @@ def plan_suggestions(req: "SuggestPlanRequest"):
     ranked = []
     for r in pool:
         ks = _kw_score(r, tokens)
-        try:
-            pr = float(r.get("priority_score") or 0.0)
-        except Exception:
-            pr = 0.0
-        try:
-            pop = float(r.get("popularity_score") or 0.0)
-        except Exception:
-            pop = 0.0
+        pr = float(r.get("priority_score") or 0.0)
+        pop = float(r.get("popularity_score") or 0.0)
 
         vs = 0.0
         if qvec is not None:
@@ -895,9 +906,8 @@ def plan_suggestions(req: "SuggestPlanRequest"):
     ranked.sort(key=lambda x: x["_scores"]["final"], reverse=True)
 
     # ---------- Top-k with phase coverage ----------
-    req_top_k = int(getattr(req, "top_k", 8) or 8)
-    min_k = max(req_top_k, len(ai_scope.get("_required_phases_list", [])))
-    top_k = max(1, min(min_k, 50))
+    required_phases = ai_scope.get("_required_phases_list", [])
+    top_k = max(len(required_phases) or 1, 5)  # up to 1 per phase
 
     seen, items = set(), []
     for r in ranked:
@@ -912,11 +922,12 @@ def plan_suggestions(req: "SuggestPlanRequest"):
         if len(items) >= top_k:
             break
 
+    # ensure 1 per phase
     items = _ensure_phase_coverage(
         ranked=ranked,
         base_items=items,
         needs=needs,
-        required_phases_list=ai_scope.get("_required_phases_list", []),
+        required_phases_list=required_phases,
         top_k=top_k,
     )
 
@@ -946,13 +957,7 @@ def plan_suggestions(req: "SuggestPlanRequest"):
                 "provider": "db",
             }
 
-        r["estimate"] = {
-            "db_days": int(est.get("db_days") or 0),
-            "ai_days": (float(est.get("ai_days")) if est.get("ai_days") is not None else None),
-            "chosen_days": int(est.get("chosen_days") or 0),
-            "provider": str(est.get("provider") or "db"),
-        }
-
+        r["estimate"] = est
         try:
             p = float(r.get("price_man_day") or 0.0)
         except Exception:
@@ -976,35 +981,11 @@ def plan_suggestions(req: "SuggestPlanRequest"):
     max_score = max((r.get("_scores", {}).get("final", 0.0) for r in items), default=0.0)
 
     for r in items:
-        serialized: Dict[str, Any] = {}
-        for fld in allowed_fields:
-            v = r.get(fld)
-            if v is None:
-                if fld in ("canonical_names", "target_platforms"):
-                    serialized[fld] = []
-                elif fld in ("supports_db_migration",):
-                    serialized[fld] = bool(r.get(fld, False))
-                else:
-                    serialized[fld] = _to_py(v)
-            else:
-                serialized[fld] = _to_py(v)
-
+        serialized = {fld: _to_py(r.get(fld)) for fld in allowed_fields}
         scores = _to_py(r.get("_scores") or {})
-        serialized["_scores"] = {k: (float(v) if v is not None else None) for k, v in (scores.items() if scores else {})} or {
-            "final": 0.0, "keyword": 0.0, "vector": 0.0, "priority": 0.0, "popularity": 0.0, "relevance": 0.0
-        }
-
-        reasons = _to_py(r.get("_reasons") or [])
-        if reasons:
-            serialized["reasons"] = [str(x) for x in reasons][:8]
-            serialized["reason"] = ", ".join(serialized["reasons"])
-        else:
-            kw = serialized["_scores"].get("keyword", 0.0)
-            pr = serialized["_scores"].get("priority", 0.0)
-            vec = serialized["_scores"].get("vector", 0.0)
-            serialized["reasons"] = [f"kw={kw:.2f}", f"prio={pr:.2f}", f"vec={vec:.2f}"]
-            serialized["reason"] = ", ".join(serialized["reasons"])
-
+        serialized["_scores"] = {k: float(v) if v is not None else 0.0 for k, v in scores.items()}
+        serialized["reasons"] = [str(x) for x in _to_py(r.get("_reasons") or [])][:8]
+        serialized["reason"] = ", ".join(serialized["reasons"])
         est = _to_py(r.get("estimate") or {})
         serialized["estimate"] = {
             "db_days": int(est.get("db_days") or 0),
@@ -1013,20 +994,10 @@ def plan_suggestions(req: "SuggestPlanRequest"):
             "provider": str(est.get("provider") or "db"),
         }
         serialized["cost_estimate"] = float(round(_to_py(r.get("cost_estimate") or 0.0), 2))
-
-        try:
-            serialized["score"] = float(serialized["_scores"].get("final") or 0.0)
-        except Exception:
-            serialized["score"] = 0.0
-
-        try:
-            if max_score and max_score > 0:
-                serialized["score_normalized"] = round(float(serialized["score"]) / float(max_score) * 100.0, 2)
-            else:
-                serialized["score_normalized"] = round(float(serialized["score"]) * 10.0, 2)
-        except Exception:
-            serialized["score_normalized"] = float(serialized["score"])
-
+        serialized["score"] = float(serialized["_scores"].get("final", 0.0))
+        serialized["score_normalized"] = (
+            round(serialized["score"] / max_score * 100.0, 2) if max_score > 0 else round(serialized["score"] * 10.0, 2)
+        )
         items_serialized.append(serialized)
 
     # ---------- Journey ----------
