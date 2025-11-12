@@ -1,20 +1,35 @@
 # app/routers/suggest.py
 from __future__ import annotations
-from fastapi import APIRouter, HTTPException, Form
+
+from fastapi import APIRouter, HTTPException, Form, Depends
 from typing import Any, Dict, List, Tuple
 import logging
 import numpy as np
 from decimal import Decimal
-import itertools, math
+
 from app.models.schemas import SuggestPlanRequest, SuggestPlanResponse
-from app.services.ranker import plan_suggestions 
+from app.services.ranker import plan_suggestions
+from app.routers.ranker_feedback import apply_user_feedback
 
 router = APIRouter(prefix="/suggest", tags=["suggest"])
 log = logging.getLogger("suggest")
 
-# ------------------ utils ------------------
+# ============================================
+# Auth Dependency Import
+# ============================================
+try:
+    from app.routers.auth import get_optional_user
+except ImportError:
+    # Fallback if auth not available yet
+    async def get_optional_user() -> str | None:
+        return None
+
+# ============================================
+# Utility Functions
+# ============================================
 
 def _to_python_native(val):
+    """Convert numpy/bytes/Decimal to native Python types"""
     if val is None:
         return None
     try:
@@ -37,7 +52,9 @@ def _to_python_native(val):
         return {str(k): _to_python_native(v) for k, v in val.items()}
     return val
 
+
 def _serialize_item(item: Any) -> Dict[str, Any]:
+    """Serialize a service item to dict with native Python types"""
     raw = None
     try:
         if hasattr(item, "model_dump"):
@@ -77,7 +94,9 @@ def _serialize_item(item: Any) -> Dict[str, Any]:
 
     return normalized
 
+
 def _derive_score_and_reason(row: Dict[str, Any]) -> Tuple[float, str, List[str]]:
+    """Extract score and reasoning from service row"""
     score_val = 0.0
     reason_parts: List[str] = []
 
@@ -116,7 +135,9 @@ def _derive_score_and_reason(row: Dict[str, Any]) -> Tuple[float, str, List[str]
 
     return score_val, (", ".join(reason_parts) if reason_parts else "matched"), reason_parts
 
+
 def _phase_order_from_debug(debug: dict) -> List[str]:
+    """Extract phase order from debug info"""
     ai = debug.get("scope", {}).get("ai", {})
     des = set(ai.get("desirable", []) or [])
     order = []
@@ -131,6 +152,7 @@ def _phase_order_from_debug(debug: dict) -> List[str]:
     if des.intersection({"dr", "disaster", "recovery", "replication", "protection", "metro", "near"}):
         order.append("dr")
     return order
+
 
 def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest) -> Dict[str, Any]:
     """
@@ -194,27 +216,23 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
 
         pool.append(r)
 
-    # 2) Always include must_include items, even if filtered out above, with notes
-    forced: List[Dict[str, Any]] = []
+    # 2) Always include must_include items
+    forced: List[Tuple[Dict[str, Any], bool]] = []
     for minc in must_include_names:
-        # find highest scored match by name contains or exact
         matches = [
             r for r in items
             if minc in norm_name(r.get("service_name")) or norm_name(r.get("service_name")) == minc
         ]
         if matches:
-            # pick max by score
             pick = max(matches, key=lambda x: float((x.get("score") or 0.0)))
-            # annotate conflict if target mismatch
             fam = (pick.get("product_family") or "").upper()
             targets = [str(t).lower() for t in (pick.get("target_platforms") or [])]
             conflict = False
             if required_targets and targets and not (required_targets.intersection(targets)):
                 conflict = True
                 warnings.append(
-                    f"Service '{pick.get('service_name')}' was required by must_include but its "
-                    f"target_platforms={targets} do not match constraints.target_platforms={list(required_targets)}. "
-                    f"Included anyway."
+                    f"Service '{pick.get('service_name')}' was required by must_include but target_platforms={targets} "
+                    f"do not match constraints.target_platforms={list(required_targets)}. Included anyway."
                 )
             if required_families and fam not in required_families:
                 conflict = True
@@ -224,10 +242,10 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
                 )
             forced.append((pick, conflict))
 
-    # 3) Rank remaining pool by your computed score
+    # 3) Rank remaining pool by score
     ranked = sorted(pool, key=lambda x: float((x.get("score") or 0.0)), reverse=True)
 
-    # 4) Compose the selection: forced first (dedup), then ranked
+    # 4) Compose selection
     seen_keys = set()
     selected: List[Dict[str, Any]] = []
 
@@ -251,10 +269,7 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
         selected.append(entry)
 
     for pick, conflict in forced:
-        add_row(
-            pick,
-            note="Included due to must_include" + (" (constraint conflict)" if conflict else "")
-        )
+        add_row(pick, note="Included due to must_include" + (" (constraint conflict)" if conflict else ""))
         if len(selected) >= limit:
             break
 
@@ -263,7 +278,6 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
             break
         add_row(r)
 
-    # If nothing selected, return empty with suggestion
     if not selected:
         return {
             "selected_services": [],
@@ -279,7 +293,6 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
     total_days = sum(int(x["duration_days"]) for x in selected)
     total_cost = round(sum(float(x["cost"]) for x in selected), 2)
 
-    # --- Concise proposal mode trim ---
     if getattr(req, "proposal_type", None) == "concise":
         ndp = [
             r for r in items
@@ -323,7 +336,6 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
             ],
         }
 
-    # --- Default full mode ---
     return {
         "selected_services": selected,
         "total_duration_days": total_days,
@@ -336,10 +348,22 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
     }
 
 
-# ------------------ route ------------------
+# ============================================
+# Main Suggestion Endpoint
+# ============================================
 
 @router.post("/plan", response_model=SuggestPlanResponse)
-def suggest_plan(req: SuggestPlanRequest):
+def suggest_plan(
+    req: SuggestPlanRequest,
+    user_id: str | None = Depends(get_optional_user)
+):
+    """
+    Suggest optimal service plan with optional personalization.
+    
+    - If user is authenticated, applies learned preferences from feedback
+    - Returns phase-aware journey with services, costs, and durations
+    - Supports constraints (must_include, must_exclude, product_families)
+    """
     try:
         out = plan_suggestions(req)
     except Exception as e:
@@ -351,18 +375,18 @@ def suggest_plan(req: SuggestPlanRequest):
     else:
         items_raw, debug = out, {}
 
-    # serialize items
+    # Serialize items
     items_serialized: List[Dict[str, Any]] = []
     for itm in items_raw or []:
         row = _serialize_item(itm) if not isinstance(itm, dict) else {k: _to_python_native(v) for k, v in itm.items()}
 
-        # score + reasons
+        # Score + reasons
         score_val, reason_text, reason_list = _derive_score_and_reason(row)
         row["score"] = float(row.get("score") or score_val or 0.0)
         row["reasons"] = reason_list or row.get("reasons") or []
         row["reason"] = ", ".join(str(x) for x in (row["reasons"][:8] if row.get("reasons") else [reason_text]))
 
-        # ensure estimate
+        # Ensure estimate
         if "estimate" not in row or not isinstance(row["estimate"], dict):
             try:
                 db_days = int(row.get("duration_days") or 1)
@@ -370,7 +394,6 @@ def suggest_plan(req: SuggestPlanRequest):
                 db_days = 1
             row["estimate"] = {"db_days": db_days, "ai_days": None, "chosen_days": db_days, "provider": "db"}
         else:
-            # type safety
             try:
                 row["estimate"]["db_days"] = int(row["estimate"].get("db_days") or 0)
                 row["estimate"]["chosen_days"] = int(row["estimate"].get("chosen_days") or 0)
@@ -379,14 +402,14 @@ def suggest_plan(req: SuggestPlanRequest):
             except Exception:
                 pass
 
-        # price coercion
+        # Price coercion
         if "price_man_day" in row:
             try:
                 row["price_man_day"] = float(row["price_man_day"]) if row["price_man_day"] is not None else None
             except Exception:
                 pass
 
-        # cost fallback
+        # Cost fallback
         if "cost_estimate" not in row:
             try:
                 price = float(row.get("price_man_day")) if row.get("price_man_day") is not None else 0.0
@@ -400,16 +423,57 @@ def suggest_plan(req: SuggestPlanRequest):
 
         items_serialized.append(row)
 
-    # normalize scores
+    # ============================================
+    # USER FEEDBACK PERSONALIZATION
+    # ============================================
+    if user_id:
+        try:
+            base_scores = {
+                int(it["id"]): float(it.get("score") or 0.0)
+                for it in items_serialized if it.get("id") is not None
+            }
+            if base_scores:
+                log.info(f"Applying user feedback for user_id={user_id}")
+                adj_scores = apply_user_feedback(base_scores, user_id)
+                
+                adjustment_count = 0
+                for it in items_serialized:
+                    sid = it.get("id")
+                    if sid in adj_scores:
+                        old_score = it["score"]
+                        it["score"] = float(adj_scores[sid])
+                        
+                        # Log significant adjustments
+                        if abs(it["score"] - old_score) > 0.1:
+                            adjustment_count += 1
+                            log.debug(
+                                f"Service {sid} ({it.get('service_name')}) score adjusted: "
+                                f"{old_score:.2f} → {it['score']:.2f}"
+                            )
+                
+                if adjustment_count > 0:
+                    log.info(f"Applied {adjustment_count} significant score adjustments for user {user_id}")
+                
+                # Re-sort items by adjusted scores
+                items_serialized.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        except Exception as e:
+            log.exception(f"Failed to apply user feedback: {e}")
+            # Non-fatal - continue with base scores
+
+    # Normalize scores
     max_score = max((it.get("score") or 0.0) for it in items_serialized) if items_serialized else 0.0
     for it in items_serialized:
         try:
-            it["score_normalized"] = round(float(it.get("score", 0.0)) / float(max_score) * 100.0, 2) if max_score > 0 else round(float(it.get("score", 0.0)) * 10.0, 2)
+            it["score_normalized"] = round(
+                float(it.get("score", 0.0)) / float(max_score) * 100.0, 2
+            ) if max_score > 0 else round(float(it.get("score", 0.0)) * 10.0, 2)
         except Exception:
             it["score_normalized"] = float(it.get("score", 0.0))
 
+    # ============================================
+    # BUILD JOURNEY
+    # ============================================
     order = _phase_order_from_debug(_to_python_native(debug or {}))
-    # Build structured journey summary
     journey = {
         "phases": [
             {
@@ -504,7 +568,9 @@ def suggest_plan(req: SuggestPlanRequest):
         },
     }
 
-    # ---- optimal selection (smart combinatorial pick) ----
+    # ============================================
+    # OPTIMAL SERVICE SELECTION
+    # ============================================
     selection = {}
     try:
         selection = select_optimal_services(items_serialized, req)
@@ -512,14 +578,20 @@ def suggest_plan(req: SuggestPlanRequest):
         log.exception("select_optimal_services failed: %s", e)
         selection = {"error": f"selection_failed: {str(e)}"}
 
-
+    # ============================================
+    # BUILD RESPONSE
+    # ============================================
     resp_payload = {
         "items": items_serialized,
         "count": len(items_serialized),
         "journey": journey,
-        "debug": {**_to_python_native(debug or {}), "selection": selection},
+        "debug": {
+            **_to_python_native(debug or {}),
+            "selection": selection,
+            "personalized": bool(user_id),
+            "user_id": user_id if user_id else None,
+        },
     }
-
 
     try:
         return SuggestPlanResponse(**resp_payload)
@@ -528,24 +600,26 @@ def suggest_plan(req: SuggestPlanRequest):
         raise HTTPException(status_code=500, detail=f"Response validation error: {e}")
 
 
+# ============================================
+# Form-based Endpoint (for frontend compatibility)
+# ============================================
+
 @router.post("", response_model=SuggestPlanResponse)
 def suggest_plan_form(
     client_name: str = Form("Client"),
     industry: str | None = Form(None),
     requirements_text: str = Form(...),
     top_k: int = Form(6),
-    # optional FE extras:
-    hardware_providers: str | None = Form(None),  # e.g. "NUTANIX, DELL"
+    hardware_providers: str | None = Form(None),
     boq_text: str | None = Form(None),
     limit: int = Form(8),
-    proposal_type: str | None = Form(None),       # e.g. "concise"
+    proposal_type: str | None = Form(None),
+    user_id: str | None = Depends(get_optional_user),
 ):
     """
     Accepts FormData from the frontend and forwards it to the JSON /suggest/plan
     by constructing a SuggestPlanRequest payload.
     """
-    # Parse vendors string into tokens for constraints.must_exclude (example policy).
-    # Adjust to your needs (e.g., must_include or product_families) if desired.
     vendor_tokens = []
     if hardware_providers:
         vendor_tokens = [v.strip().lower() for v in hardware_providers.split(",") if v.strip()]
@@ -557,15 +631,12 @@ def suggest_plan_form(
         "top_k": top_k,
         "limit": limit,
         "proposal_type": proposal_type,
-        # You can pass any extra context your planner uses:
         "context": {
             "hardware_providers": vendor_tokens,
             "boq_text": boq_text or "",
         },
-        # Basic constraints example: exclude services containing vendor tokens
         "constraints": {
             "must_exclude": vendor_tokens,
-            # leave others empty so your selector stays permissive by default
             "must_include": [],
             "product_families": [],
             "target_platforms": [],
@@ -575,7 +646,6 @@ def suggest_plan_form(
     try:
         req_obj = SuggestPlanRequest(**payload)
     except Exception as e:
-        # If your Pydantic schema names differ, inspect and adapt the keys above.
         raise HTTPException(status_code=422, detail=f"Invalid suggest payload: {e}")
 
-    return suggest_plan(req_obj)
+    return suggest_plan(req_obj, user_id=user_id)
