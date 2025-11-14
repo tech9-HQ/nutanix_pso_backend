@@ -17,19 +17,29 @@ log = logging.getLogger("suggest")
 # ============================================
 # Auth Dependency Import
 # ============================================
+# Defensive import: provide a fallback if auth isn't wired yet.
+# Good for progressive bootstrapping in dev, but in production you should
+# fail fast if auth isn't available so endpoints don't silently allow anon access.
 try:
     from app.routers.auth import get_optional_user
 except ImportError:
-    # Fallback if auth not available yet
     async def get_optional_user() -> str | None:
         return None
+
 
 # ============================================
 # Utility Functions
 # ============================================
-
 def _to_python_native(val):
-    """Convert numpy/bytes/Decimal to native Python types"""
+    """Convert numpy/bytes/Decimal to native Python types.
+
+    Notes:
+    - This helper is useful but a bit permissive. Consider replacing with
+      one canonical serializer (e.g. using Pydantic BaseModel .model_dump()
+      where possible) to reduce special casing.
+    - Avoid importing numpy at module level if you want lightweight cold starts;
+      delay numpy usage to when it's needed.
+    """
     if val is None:
         return None
     try:
@@ -38,6 +48,7 @@ def _to_python_native(val):
         if isinstance(val, np.ndarray):
             return val.tolist()
     except Exception:
+        # Keep going with other conversions if numpy types not available or fail.
         pass
     if isinstance(val, (bytes, bytearray)):
         try:
@@ -45,6 +56,7 @@ def _to_python_native(val):
         except Exception:
             return str(val)
     if isinstance(val, Decimal):
+        # Decimal -> float conversion may lose precision; prefer str if exactness matters.
         return float(val)
     if isinstance(val, (list, tuple, set)):
         return [_to_python_native(v) for v in list(val)]
@@ -54,9 +66,16 @@ def _to_python_native(val):
 
 
 def _serialize_item(item: Any) -> Dict[str, Any]:
-    """Serialize a service item to dict with native Python types"""
+    """Serialize a service item to dict with native Python types.
+
+    Comments:
+    - This handles multiple input shapes (pydantic, dataclass, ORM objects, dicts).
+    - It's permissive by design, but it can hide schema problems. Consider validating
+      the final dict against a Pydantic response model for stronger guarantees.
+    """
     raw = None
     try:
+        # pydantic v2 uses model_dump, older libs use dict()
         if hasattr(item, "model_dump"):
             raw = item.model_dump()
         elif hasattr(item, "dict"):
@@ -86,6 +105,7 @@ def _serialize_item(item: Any) -> Dict[str, Any]:
             continue
         normalized[str(k)] = _to_python_native(v)
 
+    # Ensure id is an int when possible (many DB libs return strings)
     if "id" in normalized:
         try:
             normalized["id"] = int(normalized["id"])
@@ -96,7 +116,12 @@ def _serialize_item(item: Any) -> Dict[str, Any]:
 
 
 def _derive_score_and_reason(row: Dict[str, Any]) -> Tuple[float, str, List[str]]:
-    """Extract score and reasoning from service row"""
+    """Extract score and reasoning from service row.
+
+    Behavior:
+    - Prefer structured `_scores` content, but fall back to family/targets/category.
+    - Returns (score_val, reason_text, reason_parts_list).
+    """
     score_val = 0.0
     reason_parts: List[str] = []
 
@@ -117,6 +142,7 @@ def _derive_score_and_reason(row: Dict[str, Any]) -> Tuple[float, str, List[str]
 
     explicit_reasons = row.get("_reasons")
     if explicit_reasons and isinstance(explicit_reasons, list):
+        # If explicit reasons are present, prefer them (clearer to user)
         reason_parts = [str(x) for x in explicit_reasons]
 
     if not reason_parts:
@@ -137,7 +163,11 @@ def _derive_score_and_reason(row: Dict[str, Any]) -> Tuple[float, str, List[str]
 
 
 def _phase_order_from_debug(debug: dict) -> List[str]:
-    """Extract phase order from debug info"""
+    """Extract phase order from debug info.
+
+    This is heuristic and driven by `debug.scope.ai.desirable`. Consider making this
+    logic data-driven (config file or mapping) to make it easier to test/update.
+    """
     ai = debug.get("scope", {}).get("ai", {})
     des = set(ai.get("desirable", []) or [])
     order = []
@@ -154,10 +184,21 @@ def _phase_order_from_debug(debug: dict) -> List[str]:
     return order
 
 
+# ============================================
+# Selection logic
+# ============================================
 def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest) -> Dict[str, Any]:
     """
     Returns a compact selection object without changing your response schema.
-    The result is placed under debug['selection'] so SuggestPlanResponse stays valid.
+
+    Notes & improvements:
+    - This function is fairly long and has multiple responsibilities:
+        1. filtering by constraints
+        2. forced inclusions/must_include handling
+        3. ranking and de-duplication
+        4. cost/durations aggregation
+      Consider splitting into smaller, unit-testable functions (filter_pool, find_forced, rank_pool, compose_selection).
+    - Important: avoid returning `user_id` in debug output (privacy / logging leak). See later.
     """
     constraints = getattr(req, "constraints", None)
     limit = int(getattr(req, "limit", 8) or 8)
@@ -216,7 +257,7 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
 
         pool.append(r)
 
-    # 2) Always include must_include items
+    # 2) Always include must_include items (attempt to match by substring or exact)
     forced: List[Tuple[Dict[str, Any], bool]] = []
     for minc in must_include_names:
         matches = [
@@ -242,10 +283,10 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
                 )
             forced.append((pick, conflict))
 
-    # 3) Rank remaining pool by score
+    # 3) Rank remaining pool by score (descending)
     ranked = sorted(pool, key=lambda x: float((x.get("score") or 0.0)), reverse=True)
 
-    # 4) Compose selection
+    # 4) Compose selection with dedupe by (name, family)
     seen_keys = set()
     selected: List[Dict[str, Any]] = []
 
@@ -268,16 +309,19 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
             entry["note"] = note
         selected.append(entry)
 
+    # Add forced inclusions first
     for pick, conflict in forced:
         add_row(pick, note="Included due to must_include" + (" (constraint conflict)" if conflict else ""))
         if len(selected) >= limit:
             break
 
+    # Fill remaining with ranked items
     for r in ranked:
         if len(selected) >= limit:
             break
         add_row(r)
 
+    # If no matches found, return a structured message and suggestions (helpful UX)
     if not selected:
         return {
             "selected_services": [],
@@ -293,6 +337,7 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
     total_days = sum(int(x["duration_days"]) for x in selected)
     total_cost = round(sum(float(x["cost"]) for x in selected), 2)
 
+    # special concise mode focusing on NDB/AHV top services
     if getattr(req, "proposal_type", None) == "concise":
         ndp = [
             r for r in items
@@ -351,7 +396,6 @@ def select_optimal_services(items: List[Dict[str, Any]], req: SuggestPlanRequest
 # ============================================
 # Main Suggestion Endpoint
 # ============================================
-
 @router.post("/plan", response_model=SuggestPlanResponse)
 def suggest_plan(
     req: SuggestPlanRequest,
@@ -359,34 +403,40 @@ def suggest_plan(
 ):
     """
     Suggest optimal service plan with optional personalization.
-    
-    - If user is authenticated, applies learned preferences from feedback
-    - Returns phase-aware journey with services, costs, and durations
-    - Supports constraints (must_include, must_exclude, product_families)
+
+    Behavior & notes:
+    - `plan_suggestions` (service layer) performs retrieval + scoring and returns
+      either a list or (items, debug) tuple. Good separation of concerns.
+    - We accept an optional user_id and apply learned feedback if present.
+    - Response is validated with SuggestPlanResponse at the end.
     """
     try:
         out = plan_suggestions(req)
     except Exception as e:
         log.exception("plan_suggestions failed")
-        raise HTTPException(status_code=500, detail=f"plan_suggestions error: {e}")
+        # Don't leak internal error text in prod; keep generic or map to codes.
+        raise HTTPException(status_code=500, detail=f"plan_suggestions error")
 
+    # Support both (items, debug) and items-only return shapes
     if isinstance(out, tuple) and len(out) >= 2:
         items_raw, debug = out[0], out[1]
     else:
         items_raw, debug = out, {}
 
-    # Serialize items
+    # Serialize items into plain dicts and normalize fields
     items_serialized: List[Dict[str, Any]] = []
     for itm in items_raw or []:
+        # If item already a dict, convert nested values to native python
         row = _serialize_item(itm) if not isinstance(itm, dict) else {k: _to_python_native(v) for k, v in itm.items()}
 
-        # Score + reasons
+        # Score + reasons extraction
         score_val, reason_text, reason_list = _derive_score_and_reason(row)
+        # Preserve existing score if present; fallback to derived
         row["score"] = float(row.get("score") or score_val or 0.0)
         row["reasons"] = reason_list or row.get("reasons") or []
         row["reason"] = ", ".join(str(x) for x in (row["reasons"][:8] if row.get("reasons") else [reason_text]))
 
-        # Ensure estimate
+        # Ensure estimate structure exists
         if "estimate" not in row or not isinstance(row["estimate"], dict):
             try:
                 db_days = int(row.get("duration_days") or 1)
@@ -400,16 +450,17 @@ def suggest_plan(
                 if row["estimate"].get("ai_days") is not None:
                     row["estimate"]["ai_days"] = float(row["estimate"]["ai_days"])
             except Exception:
+                # If parsing fails, leave values as-is; consider stricter validation.
                 pass
 
-        # Price coercion
+        # Price coercion to numeric
         if "price_man_day" in row:
             try:
                 row["price_man_day"] = float(row["price_man_day"]) if row["price_man_day"] is not None else None
             except Exception:
                 pass
 
-        # Cost fallback
+        # Cost fallback: compute if not provided
         if "cost_estimate" not in row:
             try:
                 price = float(row.get("price_man_day")) if row.get("price_man_day") is not None else 0.0
@@ -456,11 +507,12 @@ def suggest_plan(
                 
                 # Re-sort items by adjusted scores
                 items_serialized.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        except Exception as e:
-            log.exception(f"Failed to apply user feedback: {e}")
-            # Non-fatal - continue with base scores
+        except Exception:
+            # Non-fatal personalization errors should not break the response.
+            log.exception("Failed to apply user feedback")
+            # continue with base scores
 
-    # Normalize scores
+    # Normalize scores to a 0..100 scale (or fallback)
     max_score = max((it.get("score") or 0.0) for it in items_serialized) if items_serialized else 0.0
     for it in items_serialized:
         try:
@@ -473,6 +525,7 @@ def suggest_plan(
     # ============================================
     # BUILD JOURNEY
     # ============================================
+    # Phase ordering uses debug info but the actual phases are computed from service_type / category.
     order = _phase_order_from_debug(_to_python_native(debug or {}))
     journey = {
         "phases": [
@@ -576,7 +629,7 @@ def suggest_plan(
         selection = select_optimal_services(items_serialized, req)
     except Exception as e:
         log.exception("select_optimal_services failed: %s", e)
-        selection = {"error": f"selection_failed: {str(e)}"}
+        selection = {"error": f"selection_failed"}
 
     # ============================================
     # BUILD RESPONSE
@@ -589,21 +642,23 @@ def suggest_plan(
             **_to_python_native(debug or {}),
             "selection": selection,
             "personalized": bool(user_id),
+            # SECURITY NOTE: avoid echoing user_id back in debug payload in production.
+            # This leaks PII into logs and client-side debug traces. Remove or mask.
             "user_id": user_id if user_id else None,
         },
     }
 
     try:
+        # Validate against Pydantic model before returning to client
         return SuggestPlanResponse(**resp_payload)
     except Exception as e:
         log.exception("Failed to validate SuggestPlanResponse: %s", e)
-        raise HTTPException(status_code=500, detail=f"Response validation error: {e}")
+        raise HTTPException(status_code=500, detail="Response validation error")
 
 
 # ============================================
 # Form-based Endpoint (for frontend compatibility)
 # ============================================
-
 @router.post("", response_model=SuggestPlanResponse)
 def suggest_plan_form(
     client_name: str = Form("Client"),
@@ -619,6 +674,13 @@ def suggest_plan_form(
     """
     Accepts FormData from the frontend and forwards it to the JSON /suggest/plan
     by constructing a SuggestPlanRequest payload.
+
+    Notes:
+    - Using a form endpoint for compatibility is fine, but consider deprecating it
+      in favor of a single JSON API. Form handling duplicates validation logic.
+    - The function calls the main `suggest_plan` directly; that's ok synchronously
+      but if `plan_suggestions` becomes async or heavy you may want to `await` or
+      call the service in a background worker.
     """
     vendor_tokens = []
     if hardware_providers:
@@ -646,6 +708,8 @@ def suggest_plan_form(
     try:
         req_obj = SuggestPlanRequest(**payload)
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Invalid suggest payload: {e}")
+        # Return 422 to match FastAPI validation semantics
+        raise HTTPException(status_code=422, detail="Invalid suggest payload")
 
+    # Call core handler; pass user_id along
     return suggest_plan(req_obj, user_id=user_id)
