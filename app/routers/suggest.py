@@ -9,7 +9,7 @@ from decimal import Decimal
 
 from app.models.schemas import SuggestPlanRequest, SuggestPlanResponse
 from app.services.ranker import plan_suggestions
-from app.routers.ranker_feedback import apply_user_feedback
+from app.services.ranker_feedback import apply_user_feedback
 
 router = APIRouter(prefix="/suggest", tags=["suggest"])
 log = logging.getLogger("suggest")

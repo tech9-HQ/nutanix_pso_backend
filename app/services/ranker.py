@@ -9,6 +9,7 @@ from app.models.schemas import SuggestPlanRequest
 from app.services.proposals_repo import suggest_services_repo
 from app.services.duration_estimator import estimate_days_from_web, pick_days_with_rule, call_llm
 from app.services.company_size import get_company_size
+from app.services.ranker_feedback import apply_user_feedback
 
 log = logging.getLogger("ranker")
 
@@ -914,6 +915,12 @@ def plan_suggestions(req: "SuggestPlanRequest"):
     (assessment, deployment, migration, database, dr).
     """
 
+    # ---------- Extract user_id from request ----------
+    user_id = (
+        getattr(req, "user_id", None)
+        or getattr(getattr(req, "meta", None), "user_id", None)
+    )
+
     # ---------- Intent text ----------
     intent_text = " ".join([
         getattr(req, "requirements_text", "") or "",
@@ -1136,6 +1143,23 @@ def plan_suggestions(req: "SuggestPlanRequest"):
         ranked.append(rr)
 
     ranked.sort(key=lambda x: x["_scores"]["final"], reverse=True)
+
+    # ---------- Apply per-user feedback (re-rank) ----------
+    if user_id:
+        try:
+            base_scores = {
+                int(r["id"]): float(r["_scores"]["final"])
+                for r in ranked
+                if r.get("id") is not None
+            }
+            adj_scores = apply_user_feedback(base_scores, user_id=user_id)
+            for r in ranked:
+                sid = r.get("id")
+                if sid in adj_scores:
+                    r["_scores"]["final"] = float(adj_scores[sid])
+            ranked.sort(key=lambda x: x["_scores"]["final"], reverse=True)
+        except Exception as e:
+            log.warning("apply_user_feedback failed: %s", e)
 
     # ---------- Ensure 1 per phase ----------
     items = _ensure_phase_coverage(

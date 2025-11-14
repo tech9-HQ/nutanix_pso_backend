@@ -5,7 +5,7 @@ load_dotenv()
 from fastapi import FastAPI
 from app.middleware import install_middlewares
 from app.logging_config import setup_logging
-from app.routers import health, suggest, meta
+from app.routers import health, suggest, meta, ranker_feedback
 from app.routers.generate_proposal import router as generate_proposal_router
 from app.routers.generate_proposal_short import router as generate_proposal_short_router
 from app.routers.routes_feedback import router as feedback_router
@@ -34,6 +34,7 @@ app.include_router(meta.router)
 app.include_router(suggest.router)
 app.include_router(generate_proposal_router)
 app.include_router(generate_proposal_short_router)
+app.include_router(ranker_feedback.router)
 
 @app.get("/")
 def root():
