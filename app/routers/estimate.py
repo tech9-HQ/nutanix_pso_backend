@@ -292,3 +292,5 @@ async def estimate_days(
         # Logging entire exception is good for ops, but returning `str(e)` can leak internals.
         log.exception("estimate_days failed")
         return JSONResponse({"error": "internal error", "detail": str(e)}, status_code=500)
+
+

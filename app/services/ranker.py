@@ -528,6 +528,23 @@ def _honor_constraints(row: Dict[str, Any], req: SuggestPlanRequest, scope: Dict
 
     allowed_fams = set((getattr(req, "constraints", None) and (req.constraints.product_families or [])) or (ai_scope.get("product_families") or []))
     fam = (row.get("product_family") or "").upper()
+
+    if fam == "MIGRATION":
+        if (
+            "migration" in txt
+            or "migrate" in txt
+            or "move" in txt
+            or "rehost" in txt
+            or "cutover" in txt
+            or "lift and shift" in txt
+            or "lift-and-shift" in txt
+            or "vmware" in txt
+            or "hyperv" in txt
+        ):
+            # force-allow this family
+            if allowed_fams:
+                allowed_fams.add("MIGRATION")
+    
     if allowed_fams and fam and fam not in allowed_fams:
         return False
 
@@ -554,6 +571,16 @@ def _dynamic_service_fetch(req: SuggestPlanRequest, scope: Dict[str, Any], ai_sc
     fam_from_req = list(getattr(req, "constraints", None) and (req.constraints.product_families or []) or [])
     fam_from_ai  = list(ai_scope.get("product_families") or [])
     families = fam_from_req or fam_from_ai or ["NCI","NC2","NDB","NKP","NUS"]
+
+    # NEW: if migration is a required phase, include MIGRATION pseudo-family
+    required_phases_list = list(ai_scope.get("_required_phases_list") or [])
+    qtext = (getattr(req, "requirements_text", "") or "").lower()
+    if (
+        "migration" in required_phases_list
+        or any(k in qtext for k in ["migrate", "migration", "move", "rehost", "cutover"])
+    ):
+        if "MIGRATION" not in families:
+            families.append("MIGRATION")
 
     if scope.get("has_database") and "NDB" not in families:
         families.append("NDB")
@@ -589,6 +616,7 @@ def _dynamic_service_fetch(req: SuggestPlanRequest, scope: Dict[str, Any], ai_sc
                     seen.add(rid)
                     out.append(r)
     return out
+
 
 # ------------------ scoring ------------------
 
@@ -712,7 +740,10 @@ def _calc_relevance(
     # Penalize irrelevant vendor
     if "powerflex" in name and "powerflex" not in qt:
         score -= 0.60; reasons.append("Irrelevant vendor (PowerFlex)")
-
+    
+    if "cisco" in name and "cisco" not in qt:
+        score -= 0.30; reasons.append("Cisco-specific, but no Cisco in scope")
+    
     # Penalize EUC or OTHER families unless explicitly requested
     if family in {"OTHER"} and not any(k in qt for k in ["euc","end user","naigpt","ai "]):
         score -= 0.35
@@ -1067,6 +1098,11 @@ def plan_suggestions(req: "SuggestPlanRequest"):
     # ---------- Product family relevance gate ----------
     if ai_scope.get("product_families"):
         allowed_fams = {pf.upper() for pf in ai_scope["product_families"]}
+
+        # allow MIGRATION pseudo-family when migration is needed
+        if needs.get("needs_migration"):
+            allowed_fams |= {"MIGRATION"}
+
         gated_pool = []
         for r in pool:
             fam = str(r.get("product_family") or "").upper()
